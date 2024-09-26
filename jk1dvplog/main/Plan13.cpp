@@ -12,7 +12,10 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program. If not, see http://www.gnu.org/licenses/.
 */
-
+/* This is naive conversion to C++ originally written in BASIC
+PLAN-13 Satellite Position Calculation Program by James Miller G3RUH 
+https://www.amsat.org/amsat/articles/g3ruh/111.html
+*/
 #include <Arduino.h>
 #include "Plan13.h"
 #define DEBUG false
