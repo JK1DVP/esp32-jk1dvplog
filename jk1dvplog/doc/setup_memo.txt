@@ -1,0 +1,19 @@
+esp-idf and Arduino setup 
+24/9/25
+
+mkdir -p ~/esp
+cd esp
+
+git clone -b v4.4.8 --recursive https://github.com/espressif/esp-idf.git
+
+cd to components of the project
+
+git clone -b 2.0.17 https://github.com/espressif/arduino-esp32.git arduino-esp32
+cd arduino-esp32
+git submodule update --init --recursive
+
+
+idf.py build
+
+partition table ->  cp partitions_singleapp_large.csv ~/esp/esp-idf/components/partition_table/
+CMakeLists.txt in components/arduino-esp32
