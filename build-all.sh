@@ -29,6 +29,17 @@ copy_file()
     echo "    -> ${dst}"
 }
 
+generate_crc32_manifest()
+{
+    local dest_dir="$1"
+    local manifest="${dest_dir}/CRC32SUMS.txt"
+
+    echo
+    echo "--- Generating CRC32 manifest ---"
+
+    python3         "${ROOT_DIR}/make_crc32_manifest.py"         "${dest_dir}"         "${manifest}"
+}
+
 copy_ext_binaries()
 {
     local build_dir="$1"
@@ -170,6 +181,7 @@ echo "  binaries/mini/subcpu/app0.bin"
 echo "  binaries/mini/subcpu/bootload.bin"
 echo "  binaries/mini/subcpu/partitio.bin"
 echo "  binaries/mini/subcpu/spiffs.bin"
+echo "  binaries/mini/CRC32SUMS.txt"
 echo
 echo "HW3 / Wide:"
 echo "  binaries/Wide/dvplogger.bin"
@@ -179,3 +191,4 @@ echo "  binaries/Wide/subcpu/app0.bin"
 echo "  binaries/Wide/subcpu/bootload.bin"
 echo "  binaries/Wide/subcpu/partitio.bin"
 echo "  binaries/Wide/subcpu/spiffs.bin"
+echo "  binaries/Wide/CRC32SUMS.txt"

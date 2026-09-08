@@ -37,6 +37,10 @@
 #include "i2c_guard.h"
 #endif
 
+
+#ifndef BANDMAP_TRACE
+#define BANDMAP_TRACE 0
+#endif
 // normal 1.3inch OLED display
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2_r_1(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2_l_1(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
@@ -64,6 +68,9 @@ class U8G2 *u8g2_r;
 #include "freertos/queue.h"
 //#include <u8g2_font_t0_8_mf.h>
 
+#define DVP_STRINGIFY_INNER(x) #x
+#define DVP_STRINGIFY(x) DVP_STRINGIFY_INNER(x)
+
 uint8_t *dispbuf_r=nullptr, *dispbuf_l=nullptr;
 
 enum DisplayRequestType : uint8_t {
@@ -71,7 +78,8 @@ enum DisplayRequestType : uint8_t {
   DISPLAY_REQ_INFO_FLASH,
   DISPLAY_REQ_CONTEST_SETTINGS,
   DISPLAY_REQ_BANDMAP,
-  DISPLAY_REQ_CWBUF
+  DISPLAY_REQ_CWBUF,
+  DISPLAY_REQ_RTTY_RX
 };
 
 struct DisplayRequest {
@@ -145,6 +153,7 @@ void process_display_requests()
         break;
       case DISPLAY_REQ_BANDMAP: request_bandmap_update_on_demand(); break;
       case DISPLAY_REQ_CWBUF: display_cw_buf_lcd(req.text); break;
+      case DISPLAY_REQ_RTTY_RX: upd_display_rtty_decoder(req.text); break;
     }
   }
   if (s_display_dropped) {
@@ -235,7 +244,8 @@ void process_dupe_aware_display_update()
       s_bandmap_update_pending &&
       !plogw->sat &&
       !dupechk_remote_query_pending() &&
-      !(info_disp.show_info == INFO_DISP_FLASH && info_disp.timer > 0)) {
+      !(info_disp.show_info == INFO_DISP_FLASH && info_disp.timer > 0) &&
+      !(info_disp.show_info == INFO_DISP_RTTY_RX && info_disp.timer > 0)) {
     s_bandmap_update_pending = false;
     service_mux_transport();
     upd_display_bandmap();
@@ -424,6 +434,44 @@ void upd_display_info_flash(const char *s) {
   i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
   // set timer
   info_disp.timer = 5000;
+}
+
+// Show rig-decoded RTTY text on the left OLED.  The USB task may call this
+// function; in that case defer the actual I2C/display work to the main loop.
+// Row 0 is a small title and rows 1..5 are the latest five decoded lines.
+void upd_display_rtty_decoder(const char *s) {
+  if (defer_display(DISPLAY_REQ_RTTY_RX, s)) return;
+
+  select_left_display();
+  u8g2_l->clearBuffer();
+  if (plogw->f_console_emu) clear_display_emu(1);
+
+  display_printStr("RTTY RX", 10);
+
+  int row = 0;
+  const char *p = s;
+  while (p != nullptr && *p != '\0' && row < 5) {
+    const char *eol = strchr(p, '\n');
+    size_t len = eol ? (size_t)(eol - p) : strlen(p);
+    char line[32];
+    if (len >= sizeof(line)) len = sizeof(line) - 1;
+    memcpy(line, p, len);
+    line[len] = '\0';
+    display_printStr(line, 11 + row);
+    ++row;
+    if (!eol) break;
+    p = eol + 1;
+  }
+  while (row < 5) {
+    display_printStr("", 11 + row);
+    ++row;
+  }
+
+  info_disp.show_info = INFO_DISP_RTTY_RX;
+  // Keep the decoder visible while characters continue to arrive, but return
+  // to the normal bandmap after ten seconds of decoder silence.
+  info_disp.timer = 10000;
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");
 }
 
 void upd_display_tm() {
@@ -864,12 +912,6 @@ static void upd_display_render(bool flush_to_oled) {
 				    &ps_c,&pl_c,&caret_c,
 				    &total_cols);
 
-	  console->print("total_cols:");
-	  console->print(total_cols);	  
-	  console->print(" caret_c:");
-	  console->print(caret_c);	  
-	  console->print(" caret_b:");
-	  console->println(caret_b);	  
 	  //	  window_line_by_columns_caret_cjk(composed, total_cols, caret_c,
 	  //					   15, 13,
 	  //					   dp->lcdbuf, sizeof(dp->lcdbuf),
@@ -881,10 +923,6 @@ static void upd_display_render(bool flush_to_oled) {
 				       dp->lcdbuf,sizeof(dp->lcdbuf),
 				       &colL, &caret_local       );
 	  radio->idx_cursor=caret_local;	  
-	  console->print(" colL:");
-	  console->print(colL);	  
-	  console->print(" caret_local:");
-	  console->println(caret_local);	  
           break;
         case 7:  // editing satellite name
           sprintf(dp->lcdbuf, "%-s", plogw->sat_name + 2);
@@ -1084,11 +1122,21 @@ void init_display() {
   //  w = u8g2_r->getStrWidth(lcdbuf);
   dp->wcol = 128;  // the whole line
 
+  char build_line[40];
+  snprintf(build_line, sizeof(build_line), "%s HW%s",
+           __DATE__, DVP_STRINGIFY(JK1DVPLOG_HWVER));
+
   u8g2_l->drawStr(0, 0, "DVPlogger");
-  //  u8g2_l->drawStr(0, 13, "Initializing");
-  u8g2_l->drawUTF8(0, 13, "初期化中...");
+  u8g2_l->drawStr(0, 13, JK1DVPLOG_VERSION_STRING);
+  u8g2_l->drawStr(0, 26, build_line);
+  u8g2_l->drawStr(0, 39, __TIME__);
+  u8g2_l->drawUTF8(0, 52, "初期化中...");
+
+  console->printf("[BUILD] DVPlogger %s HW%s built %s %s\n",
+                  JK1DVPLOG_VERSION_STRING,
+                  DVP_STRINGIFY(JK1DVPLOG_HWVER),
+                  __DATE__, __TIME__);
   console->println("初期化中...");
-  u8g2_l->drawStr(0, 23, JK1DVPLOG_VERSION_STRING);  
 
   i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
   console->println("disp initialized.");
@@ -1884,6 +1932,7 @@ void upd_display_info() {
       //upd_display_info_contest_settings();
       break;
     case INFO_DISP_FLASH:
+    case INFO_DISP_RTTY_RX:
     case INFO_DISP_HELP:
       // keep displaying previous
       return;
@@ -1929,12 +1978,16 @@ void upd_disp_info_qso_entry() {
 
 
 static void bandmap_display_heap_trace(const char *tag) {
+#if BANDMAP_TRACE
   if (defer_display(DISPLAY_REQ_BANDMAP)) return;
   console->printf("[BANDMAPTRACE] display %-18s free=%u largest=%u min=%u\n",
                   tag,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                   (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#else
+  (void)tag;
+#endif
 }
 
 void upd_display_bandmap() {
@@ -2179,10 +2232,13 @@ void upd_display_bandmap() {
   if (this_trace <= 5 || trace_free_after + 512 < trace_free_before ||
       trace_largest_after + 512 < trace_largest_before) {
     bandmap_display_heap_trace("leave");
-    console->printf("[BANDMAPTRACE] display delta seq=%lu free=%d largest=%d\n",
+#if BANDMAP_TRACE
+    console->printf("[BANDMAPTRACE] display delta seq=%lu free=%d largest=%d
+",
                     (unsigned long)this_trace,
                     (int)trace_free_after - (int)trace_free_before,
                     (int)trace_largest_after - (int)trace_largest_before);
+#endif
   }
 }
 

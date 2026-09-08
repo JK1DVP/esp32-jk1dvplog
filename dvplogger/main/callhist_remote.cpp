@@ -24,6 +24,7 @@
 #include "settings.h"
 #include "callhist_remote.h"
 #include "callhist.h"
+#include "dupechk.h"
 #include "mux_transport.h"
 #ifdef DVPLOGGER_EXT
 struct remote_callhist_entry { char call[LEN_CALLSIGN+1]; char exch[LEN_EXCH+1]; };
@@ -103,7 +104,7 @@ void process_callhist_end_subcpu() {
 }
 
 bool search_callhist_subcpu_local(const char *call,char *exch,size_t n) {
-  for(int i=0;i<rch_count;i++) if(strcmp(rch[i].call,call)==0) {
+  for(int i=0;i<rch_count;i++) if(dupe_callsign_equal(rch[i].call,call)) {
     if(n){strncpy(exch,rch[i].exch,n-1);exch[n-1]='\0';} return true;
   }
   return false;

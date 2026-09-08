@@ -29,6 +29,7 @@
 //#include "SD.h"
 //#include "display.h"
 #include "callhist.h"
+#include "dupechk.h"
 #include "callhist_fd.h"
 //#include "settings.h"
 //#include "so2r.h"
@@ -177,19 +178,16 @@ int search_callhist_list_exch(const char **callhist_list,const char *callsign, i
     callsign1=callsign;
   }
   int i=0;
-  int ret;
   while (1) {
     if (*callhist_list[i]=='\0') return -1;
     
-    ret=strcmp(callhist_call(callhist_list[i]),callsign1);
-    if (ret==0) {
-      // match ! 
+    if (dupe_callsign_equal(callhist_call(callhist_list[i]), callsign1)) {
+      // exact DUPE/CALLHIST match after portable-suffix normalization
       *exch_history=exch_callhist(callhist_list[i]);
       return i;
     }
-    if (ret>0) {  // no longer match 
-      return -1;
-    }
+    // Normalized calls are not guaranteed to preserve the raw sort order,
+    // so continue to the end instead of using the old strcmp() early exit.
     i++;
   }
 }

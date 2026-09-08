@@ -5,7 +5,8 @@
 #include "cp2105.h"
 
 CP2105::CP2105(USB *usb)
-        : pUsb(usb), bAddress(0), bConfNum(0), bNumEP(1), ready(false) {
+        : pUsb(usb), bAddress(0), bConfNum(0), bNumEP(1), ready(false),
+          singlePort(false), deviceVid(0), devicePid(0) {
         resetState();
         if(pUsb)
                 pUsb->RegisterDeviceClass(this);
@@ -15,6 +16,9 @@ void CP2105::resetState() {
         bConfNum = 0;
         bNumEP = 1;
         ready = false;
+        singlePort = false;
+        deviceVid = 0;
+        devicePid = 0;
         for(uint8_t i = 0; i < PORTS; i++) {
                 ifaceFound[i] = false;
                 ifaceNumber[i] = i;
@@ -95,6 +99,10 @@ uint8_t CP2105::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         if(!VIDPIDOK(descriptor.idVendor, descriptor.idProduct))
                 return USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
 
+        deviceVid = descriptor.idVendor;
+        devicePid = descriptor.idProduct;
+        singlePort = (descriptor.idProduct == CP2102_PID);
+
         bAddress = pool.AllocAddress(parent, false, port);
         if(!bAddress)
                 return USB_ERROR_OUT_OF_ADDRESS_SPACE_IN_POOL;
@@ -135,7 +143,9 @@ uint8_t CP2105::Init(uint8_t parent, uint8_t port, bool lowspeed) {
                         break;
         }
 
-        if(bNumEP != maxEndpoints || !ifaceFound[0] || !ifaceFound[1]) {
+        const uint8_t expectedEndpoints = singlePort ? 3 : maxEndpoints;
+        if(bNumEP != expectedEndpoints || !ifaceFound[0] ||
+           (!singlePort && !ifaceFound[1])) {
                 Release();
                 return USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
         }
@@ -158,10 +168,12 @@ uint8_t CP2105::Init(uint8_t parent, uint8_t port, bool lowspeed) {
                 Release();
                 return rcode;
         }
-        rcode = ConfigurePort(1, 38400);
-        if(rcode) {
-                Release();
-                return rcode;
+        if(!singlePort) {
+                rcode = ConfigurePort(1, 38400);
+                if(rcode) {
+                        Release();
+                        return rcode;
+                }
         }
 
         ready = true;
@@ -199,6 +211,15 @@ uint8_t CP2105::controlOut(uint8_t port, uint8_t request,
                              length, length, data, NULL);
 }
 
+uint8_t CP2105::controlIn(uint8_t port, uint8_t request,
+                          uint16_t value, uint16_t length, uint8_t *data) {
+        if(bAddress == 0 || port >= PORTS || !ifaceFound[port] || !data)
+                return USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
+        return pUsb->ctrlReq(bAddress, 0, CP210X_REQTYPE_IN, request,
+                             value & 0xff, value >> 8, ifaceNumber[port],
+                             length, length, data, NULL);
+}
+
 uint8_t CP2105::EnablePort(uint8_t port, bool enable) {
         return controlOut(port, CP210X_IFC_ENABLE,
                           enable ? CP210X_UART_ENABLE : CP210X_UART_DISABLE);
@@ -222,11 +243,58 @@ uint8_t CP2105::SetLineControl(uint8_t port, uint16_t lineCtl) {
         return controlOut(port, CP210X_SET_LINE_CTL, lineCtl);
 }
 
-uint8_t CP2105::SetModemHandshake(uint8_t port, bool dtr, bool rts) {
-        uint16_t value = CP210X_CONTROL_WRITE_DTR | CP210X_CONTROL_WRITE_RTS;
-        if(dtr) value |= CP210X_CONTROL_DTR;
-        if(rts) value |= CP210X_CONTROL_RTS;
+/*
+ * CP210x SET_MHS follows the VCP-driver model: bits 8/9 select which
+ * modem-control outputs are to be changed, while bits 0/1 carry the
+ * requested DTR/RTS state.  Do not rewrite an unchanged output.
+ */
+uint8_t CP2105::SetModemControl(uint8_t port, uint16_t state, uint16_t mask) {
+        uint16_t value = 0;
+
+        if(mask & CP210X_CONTROL_DTR) {
+                value |= CP210X_CONTROL_WRITE_DTR;
+                if(state & CP210X_CONTROL_DTR)
+                        value |= CP210X_CONTROL_DTR;
+        }
+        if(mask & CP210X_CONTROL_RTS) {
+                value |= CP210X_CONTROL_WRITE_RTS;
+                if(state & CP210X_CONTROL_RTS)
+                        value |= CP210X_CONTROL_RTS;
+        }
+
+        if((value & (CP210X_CONTROL_WRITE_DTR |
+                     CP210X_CONTROL_WRITE_RTS)) == 0)
+                return 0;
+
         return controlOut(port, CP210X_SET_MHS, value);
+}
+
+uint8_t CP2105::SetModemHandshake(uint8_t port, bool dtr, bool rts) {
+        uint16_t state = 0;
+        if(dtr) state |= CP210X_CONTROL_DTR;
+        if(rts) state |= CP210X_CONTROL_RTS;
+        return SetModemControl(port, state,
+                               CP210X_CONTROL_DTR | CP210X_CONTROL_RTS);
+}
+
+uint8_t CP2105::SetDTR(uint8_t port, bool on) {
+        return SetModemControl(port, on ? CP210X_CONTROL_DTR : 0,
+                               CP210X_CONTROL_DTR);
+}
+
+uint8_t CP2105::SetRTS(uint8_t port, bool on) {
+        return SetModemControl(port, on ? CP210X_CONTROL_RTS : 0,
+                               CP210X_CONTROL_RTS);
+}
+
+uint8_t CP2105::GetFlow(uint8_t port, uint8_t data[16]) {
+        return controlIn(port, CP210X_GET_FLOW, 0, 16, data);
+}
+
+uint8_t CP2105::SetFlow(uint8_t port, const uint8_t data[16]) {
+        if(!data) return USB_ERROR_INVALID_ARGUMENT;
+        return controlOut(port, CP210X_SET_FLOW, 0, 16,
+                          const_cast<uint8_t *>(data));
 }
 
 uint8_t CP2105::Purge(uint8_t port) {

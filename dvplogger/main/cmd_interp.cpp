@@ -58,6 +58,7 @@
 #include "morse_decoder_simple.h"
 #include "mux_transport.h"
 #include "usb_host.h"
+#include "cw_keying.h"
 #include "web_server.h"
 #include "AudioPlayer.h"
 int cmd_interp_state = 0;
@@ -106,6 +107,8 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"dumplast", "dump the last QSO record"},
   {"dump <n>", "dump QSO record number n"},
   {"listdir", "list files in the microSD root directory"},
+  {"sdput <file> <size> <crc32>", "receive raw file bytes from serial terminal into microSD"},
+  {"ymodem", "receive one file to microSD using YMODEM-CRC (Tera Term compatible)"},
   {"DX de ...", "inject a cluster spot line"},
   {"status", "show radio status"},
   {"setstninfo <call>", "set target station information"},
@@ -145,6 +148,24 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"reset_settings", "remove saved settings files"},
   {"restart_dvplogger", "restart the Main CPU"},
   {"usb_desc", "show USB device descriptors"},
+  {"usbaudio_start", "capture 15 s of IC-705 USB audio into PSRAM"},
+  {"usbaudio_stop", "stop USB audio capture and show status"},
+  {"usbaudio_stat", "show USB audio capture status"},
+  {"usbaudio_free", "release the USB audio PSRAM buffer"},
+  {"usbaudio_desc", "show PCM2901 audio descriptors/interface/rate"},
+  {"usbaudio_sync", "USB audio ISO scheduling: usbaudio_sync [0|1]"},
+  {"usbacmstat", "show ACM address/interface/keying status"},
+  {"usbkeyif <n>", "select CDC interface n for DTR/RTS keying"},
+  {"usba0/usbadtr/usbarts/usbaboth", "directly test ACM DTR/RTS line states"},
+  {"rttytest [n]", "send n RY pairs (default 20) using [STX]/[ETX]"},
+  {"rttytx <text>", "send literal RTTY FSK text for two-radio testing"},
+  {"rttyrx <text>", "inject decoded RTTY text into display/autofill parser"},
+  {"rttyrxreset", "clear RTTY callsign consensus/autofill history"},
+  {"rttytest1 <R|Y> [n]", "send LTRS x3 then one repeated test character"},
+  {"rttybits", "dump planned Baudot cells from the last RTTY test"},
+  {"rttytiming", "show measured USB RTTY symbol timing"},
+  {"rttydump", "dump the last 64 measured USB RTTY symbol intervals"},
+  {"rttyinvert [0|1]", "show/set USB RTTY MARK/SPACE line polarity"},
   {"serial", "show serial-port allocation"},
   {"send <text>", "send text directly to Serial2"},
   {"i2c_scan", "scan the I2C bus"},
@@ -155,6 +176,9 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"cp2105port0 / cp2105port1", "select CP2105 CAT port"},
   {"cp2105baud0 <baud>", "set CP2105 port 0 baud rate"},
   {"cp2105baud1 <baud>", "set CP2105 port 1 baud rate"},
+  {"cp2105ctl <port> <D|R> <0|1>", "directly set CP2105 DTR/RTS on port 0/1"},
+  {"cp2105flow <0|1>", "show CP2105 16-byte flow-control block"},
+  {"cp2105manual <0|1>", "set CP2105 DTR/RTS to software/manual control"},
   {"cp2105debug", "toggle CP2105 TX/RX debug dump"},
   {"cp2105send0 <text>", "send raw text through CP2105 port 0"},
   {"cp2105send1 <text>", "send raw text through CP2105 port 1"},
@@ -306,6 +330,29 @@ void cmd_interp(char *cmd, Stream *output) {
       out->print("cmd:");
       out->println(cmd);
 
+      if (strcmp(cmd, "ymodem") == 0) {
+        if (out != console) {
+          out->println("YMODEM ERROR ymodem is available only on the serial console");
+          break;
+        }
+        console_ymodem_begin(out);
+        break;
+      }
+      if (strncmp(cmd, "sdput ", 6) == 0) {
+        char name[96];
+        unsigned long size = 0;
+        unsigned long crc = 0;
+        if (out != console) {
+          out->println("SDPUT ERROR sdput is available only on the serial console");
+          break;
+        }
+        if (sscanf(cmd + 6, "%95s %lu %lx", name, &size, &crc) != 3 || size == 0) {
+          out->println("usage: sdput <filename> <size> <crc32-hex>");
+          break;
+        }
+        console_sdput_begin(name, (uint32_t)size, (uint32_t)crc, out);
+        break;
+      }
       if (strcmp("loadsat", cmd) == 0) {
 	load_satinfo();
         break;
@@ -329,6 +376,33 @@ void cmd_interp(char *cmd, Stream *output) {
 	decoder.start_i2s_adc_24k_rms_task();// start morse decoder
 	out->print("started morse decoder");
 	break;
+      }
+
+      if (strncmp(cmd, "cp2105ctl ", 10) == 0) {
+        int port = -1, on = -1;
+        char line = 0;
+        if (sscanf(cmd + 10, "%d %c %d", &port, &line, &on) != 3 ||
+            (port != 0 && port != 1) ||
+            (line != 'D' && line != 'd' && line != 'R' && line != 'r') ||
+            (on != 0 && on != 1)) {
+          out->println("usage: cp2105ctl <0|1> <D|R> <0|1>");
+          break;
+        }
+        CP2105controlTest((uint8_t)port, line, on != 0, out);
+        break;
+      }
+
+      if (strncmp(cmd, "cp2105flow ", 11) == 0) {
+        int port = atoi(cmd + 11);
+        if (port < 0 || port > 1) out->println("usage: cp2105flow <0|1>");
+        else CP2105flowStatus((uint8_t)port, out);
+        break;
+      }
+      if (strncmp(cmd, "cp2105manual ", 13) == 0) {
+        int port = atoi(cmd + 13);
+        if (port < 0 || port > 1) out->println("usage: cp2105manual <0|1>");
+        else CP2105setManualFlow((uint8_t)port, out);
+        break;
       }
 
       if (strcmp(cmd, "cp2105debug") == 0) {
@@ -400,6 +474,183 @@ void cmd_interp(char *cmd, Stream *output) {
       if (strcmp(cmd,"usb_desc")==0) {
 	USB_desc();
 	break;
+      }
+      if (strcmp(cmd,"usbacmstat")==0) {
+        USBACMstatus(out);
+        break;
+      }
+      if (strncmp(cmd,"usbkeyif ",9)==0) {
+        unsigned long iface = strtoul(cmd + 9, NULL, 0);
+        USBACMselectKeyInterface((uint8_t)iface, out);
+        break;
+      }
+      if (strcmp(cmd,"usba0")==0) {
+        USBACMcontrolTest(0x00, out);
+        break;
+      }
+      if (strcmp(cmd,"usbadtr")==0) {
+        USBACMcontrolTest(0x01, out);
+        break;
+      }
+      if (strcmp(cmd,"usbarts")==0) {
+        USBACMcontrolTest(0x02, out);
+        break;
+      }
+      if (strcmp(cmd,"usbaboth")==0) {
+        USBACMcontrolTest(0x03, out);
+        break;
+      }
+      if (strncmp(cmd,"rttyrx ",7)==0) {
+        RTTYDecoderFeedText(cmd + 7, true);
+        out->printf("RTTYRX: injected: %s\n", cmd + 7);
+        break;
+      }
+      if (strcmp(cmd,"rttyrxreset")==0) {
+        RTTYDecoderResetAutofill();
+        out->println("RTTYRX: autofill history reset");
+        break;
+      }
+      if (strncmp(cmd,"rttytx ",7)==0) {
+        struct radio *r = so2r.radio_tx();
+        if (!r || r->modetype != LOG_MODETYPE_DG) {
+          out->println("RTTYTX: TX radio must be in RTTY/DG mode");
+          break;
+        }
+        if (r->f_tone_keying || (rig_fsk_port(r->rig_spec) != 3 && rig_fsk_port(r->rig_spec) != 4)) {
+          out->println("RTTYTX: select FSK:3(DTR) or FSK:4(RTS)");
+          break;
+        }
+        RTTYbaudotDiagReset();
+        append_rtty_test_text(cmd + 7);
+        out->printf("RTTYTX: queued literal text: %s\n", cmd + 7);
+        break;
+      }
+      if (strncmp(cmd,"rttytest",8)==0 && (cmd[8]=='\0' || cmd[8]==' ')) {
+        int n = 20;
+        if (cmd[8]==' ') n = atoi(cmd + 9);
+        if (n < 1) n = 1;
+        if (n > 40) n = 40;
+        struct radio *r = so2r.radio_tx();
+        if (!r || r->modetype != LOG_MODETYPE_DG) {
+          out->println("RTTYTEST: TX radio must be in RTTY/DG mode");
+          break;
+        }
+        if (r->f_tone_keying || (rig_fsk_port(r->rig_spec) != 3 && rig_fsk_port(r->rig_spec) != 4)) {
+          out->println("RTTYTEST: select FSK:3(DTR) or FSK:4(RTS)");
+          break;
+        }
+        char testbuf[96];
+        char *q = testbuf;
+        *q++ = CW_MSCMD_RTTY_STX_CHR;
+        for (int i=0; i<n && q < testbuf + sizeof(testbuf) - 3; ++i) {
+          *q++ = 'R';
+          *q++ = 'Y';
+        }
+        *q++ = CW_MSCMD_RTTY_ETX_CHR;
+        *q = '\0';
+        RTTYbaudotDiagReset();
+        append_cwbuf_string(testbuf);
+        out->printf("RTTYTEST: queued %d RY pairs, FSK:%d RP:%d lead=%d ms\n",
+                    n, rig_fsk_port(r->rig_spec),
+                    rig_rtty_invert(r->rig_spec) ? 1 : 0, rtty_ptt_lead_ms);
+        break;
+      }
+      if (strncmp(cmd,"rttytest1 ",10)==0) {
+        char ch = cmd[10];
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+        if (ch != 'R' && ch != 'Y') {
+          out->println("RTTYTEST1: use rttytest1 R [n] or rttytest1 Y [n]");
+          break;
+        }
+        int n = 12;
+        const char *np = cmd + 11;
+        while (*np == ' ') ++np;
+        if (*np) n = atoi(np);
+        if (n < 1) n = 1;
+        if (n > 24) n = 24;
+        struct radio *r = so2r.radio_tx();
+        if (!r || r->modetype != LOG_MODETYPE_DG) {
+          out->println("RTTYTEST1: TX radio must be in RTTY/DG mode");
+          break;
+        }
+        if (r->f_tone_keying || (rig_fsk_port(r->rig_spec) != 3 && rig_fsk_port(r->rig_spec) != 4)) {
+          out->println("RTTYTEST1: select FSK:3(DTR) or FSK:4(RTS)");
+          break;
+        }
+        RTTYbaudotDiagReset();
+        append_rtty_test1(ch, n);
+        out->printf("RTTYTEST1: queued LTRS x3 + %c x%d, FSK:%d RP:%d lead=%d ms\n",
+                    ch, n, rig_fsk_port(r->rig_spec),
+                    rig_rtty_invert(r->rig_spec) ? 1 : 0, rtty_ptt_lead_ms);
+        out->printf("Expected %c code=%u: START=S D0=%c D1=%c D2=%c D3=%c D4=%c STOP=M + 0.5M\n",
+                    ch, ch == 'R' ? 10 : 21,
+                    ch == 'R' ? 'S' : 'M', ch == 'R' ? 'M' : 'S',
+                    ch == 'R' ? 'S' : 'M', ch == 'R' ? 'M' : 'S',
+                    ch == 'R' ? 'S' : 'M');
+        break;
+      }
+      if (strcmp(cmd,"rttybits")==0) {
+        RTTYbaudotDiagDump(out);
+        break;
+      }
+      if (strcmp(cmd,"rttytiming")==0) {
+        USBRTTYtimingStatus(out);
+        break;
+      }
+      if (strcmp(cmd,"rttydump")==0) {
+        USBRTTYtimingDump(out);
+        break;
+      }
+      if (strcmp(cmd,"rttyinvert")==0) {
+        out->printf("USB RTTY invert=%d (logical MARK -> line %s)\n",
+                    USBRTTYgetInvert() ? 1 : 0,
+                    USBRTTYgetInvert() ? "deasserted" : "asserted");
+        break;
+      }
+      if (strncmp(cmd,"rttyinvert ",11)==0) {
+        const char *p = cmd + 11;
+        while (*p == ' ') ++p;
+        if ((p[0] != '0' && p[0] != '1') || p[1] != '\0') {
+          out->println("RTTYINVERT: use rttyinvert 0 or rttyinvert 1");
+          break;
+        }
+        USBRTTYsetInvert(p[0] == '1', out);
+        break;
+      }
+      if (strcmp(cmd,"usbaudio_start")==0) {
+        usb_audio_capture_start(out);
+        break;
+      }
+      if (strcmp(cmd,"usbaudio_stop")==0) {
+        usb_audio_capture_stop(out);
+        break;
+      }
+      if (strcmp(cmd,"usbaudio_stat")==0) {
+        usb_audio_capture_status(out);
+        break;
+      }
+      if (strcmp(cmd,"usbaudio_free")==0) {
+        usb_audio_capture_free(out);
+        break;
+      }
+      if (strcmp(cmd,"usbaudio_desc")==0) {
+        usb_audio_capture_diagnose(out);
+        break;
+      }
+      if (strcmp(cmd,"usbaudio_sync")==0) {
+        out->printf("USB AUDIO: SOF sync=%d\n",
+                    usb_audio_capture_sof_sync() ? 1 : 0);
+        break;
+      }
+      if (strncmp(cmd,"usbaudio_sync ",14)==0) {
+        const char *p = cmd + 14;
+        while (*p == ' ') ++p;
+        if ((p[0] != '0' && p[0] != '1') || p[1] != '\0') {
+          out->println("USBAUDIO_SYNC: use usbaudio_sync 0 or usbaudio_sync 1");
+          break;
+        }
+        usb_audio_capture_set_sof_sync(p[0] == '1', out);
+        break;
       }
       if (strcmp(cmd,"cp2105stat")==0) {
 	CP2105status(out);

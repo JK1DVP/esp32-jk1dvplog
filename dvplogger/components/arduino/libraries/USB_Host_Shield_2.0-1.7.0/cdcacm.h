@@ -196,6 +196,9 @@ public:
         uint8_t SetLineCoding(const LINE_CODING *dataptr);
         uint8_t GetLineCoding(LINE_CODING *dataptr);
         uint8_t SetControlLineState(uint8_t state);
+        // Diagnostic/advanced variant for composite CDC devices such as
+        // Icom radios with more than one virtual COM interface.
+        uint8_t SetControlLineStateOnInterface(uint8_t iface, uint8_t state);
         uint8_t SendBreak(uint16_t duration);
         uint8_t GetNotif(uint16_t *bytes_rcvd, uint8_t *dataptr);
 
@@ -224,6 +227,8 @@ public:
 
         uint16_t GetVid() const { return idVendor; }
         uint16_t GetPid() const { return idProduct; }
+        uint8_t GetControlIface() const { return bControlIface; }
+        uint8_t GetDataIface() const { return bDataIface; }
         bool IsDevice(uint16_t vid, uint16_t pid) const {
                 return idVendor == vid && idProduct == pid;
         }

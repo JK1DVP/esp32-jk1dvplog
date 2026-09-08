@@ -29,6 +29,7 @@
 #include "SD.h"
 #include "display.h"
 #include "callhist.h"
+#include "dupechk.h"
 #include "callhist_fd.h"
 #include "callhist_mem.h"
 #include "settings.h"
@@ -362,90 +363,64 @@ int search_callhist (char *callsign) {
 
 // search callhist and if found obtain exchange to the getexch
 int search_callhist_getexch (char *callsign,char *getexch) {
-  int len;
-  char prefix[4];
-  len = strlen(callsign);
-  if (callhist == NULL) return 0;
-  int ret;
-  int len_callhist = CALLHIST_CALLEXCH_SIZE;  // size of call history in the file
+  if (callsign == NULL || getexch == NULL || callhist == NULL) return 0;
+  if (strlen(callsign) <= 3 || !callhistf) return 0;
 
-  unsigned long usec;
-  char buf[10];
-  usec = micros();
-  if (len > 3) {
-    if (!callhistf) return 0;  // not found
-    *prefix = '\0';
-    //    strncat(prefix, callsign, 3);
-    copy_tail_character(prefix, callsign);
+  unsigned long usec = micros();
+  char base[LEN_CALLSIGN + 1];
+  normalize_dupe_callsign(callsign, base, sizeof(base));
+  const char base_tail = base[0] ? base[strlen(base) - 1] : '\0';
 
-    for (int i = 0; i < ncallhist; i++) {
-      //// use prefix
-      //if (strncmp(prefix, callhist[i].u.entry.callsign, 3) == 0) {
-      //// use tail character (to conserve memory)
-      copy_tail_character(buf, callhist[i].u.entry.callsign);
-      if (strncmp(prefix, buf, 1) == 0) {
-        // seek to the position of  prefix
-        if (callhist[i].nstations != 1) {
-          if (!callhistf.seek(callhist[i].pos)) {
-            if (!plogw->f_console_emu) plogw->ostream->println("file seek failed in search_callhist()");
-            return 0;
-          }
-        }
-        // search start from here
-        while (1) {
-          if (callhist[i].nstations == 1) {
-            // just copy from
-            memcpy(callhist_work.u.buffer, callhist[i].u.buffer, sizeof(callhist_work.u.buffer));
-          } else {
-            ret = callhistf.read(callhist_work.u.buffer, sizeof(callhist_work.u.buffer));
-            if (ret != sizeof(callhist_work.u.buffer)) break;
-          }
-          // check callsign
-          if (strcmp(callhist_work.u.entry.callsign, callsign) == 0) {
-            // matched!
-            if (!plogw->f_console_emu) {
-              plogw->ostream->print(micros() - usec);
-              plogw->ostream->print(" usec ");
-              plogw->ostream->print("matched:");
-              plogw->ostream->print(callsign);
-              plogw->ostream->print(" exch:");
-              plogw->ostream->println(callhist_work.u.entry.exch);
-            }
-            // copy to current working
+  // Call History is grouped by the last character to conserve RAM.  A base
+  // call can match a stored portable form whose last character is a digit,
+  // P (/P,/QRP) or M (/M,/MM,/AM), so scan those candidate groups too.
+  for (int i = 0; i < ncallhist; i++) {
+    char tailbuf[10];
+    copy_tail_character(tailbuf, callhist[i].u.entry.callsign);
+    const char tail = tailbuf[0];
+    const bool portable_tail = (tail >= '0' && tail <= '9') ||
+                               tail == 'P' || tail == 'p' ||
+                               tail == 'M' || tail == 'm';
+    if (tail != base_tail && !portable_tail) continue;
 
-            strcpy(getexch, callhist_work.u.entry.exch);	    
-
-
-            return 1;  // found
-          } else {
-            if (callhist[i].nstations == 1) {
-              if (!plogw->f_console_emu) {
-                plogw->ostream->print(micros() - usec);
-                plogw->ostream->println(" usec 3 ");
-              }
-              return 0;
-            }
-            //// check callsign for 3 characters with previous one
-            //  if (strncmp(callhist_work.u.entry.callsign, prefix, 3) != 0) {
-            copy_tail_character(buf, callhist_work.u.entry.callsign);
-            if (strncmp(buf, prefix, 1) != 0) {
-              // reached of the end of the prefix
-              if (!plogw->f_console_emu) {
-                plogw->ostream->print(micros() - usec);
-                plogw->ostream->println(" usec 2 ");
-              }
-              return 0;  // not found
-            }
-          }
-        }
+    if (callhist[i].nstations != 1) {
+      if (!callhistf.seek(callhist[i].pos)) {
+        if (!plogw->f_console_emu)
+          plogw->ostream->println("file seek failed in search_callhist()");
+        continue;
       }
     }
+
+    for (int n = 0; n < callhist[i].nstations; n++) {
+      if (callhist[i].nstations == 1) {
+        memcpy(callhist_work.u.buffer, callhist[i].u.buffer,
+               sizeof(callhist_work.u.buffer));
+      } else {
+        int ret = callhistf.read(callhist_work.u.buffer,
+                                 sizeof(callhist_work.u.buffer));
+        if (ret != sizeof(callhist_work.u.buffer)) break;
+      }
+
+      if (!dupe_callsign_equal(callhist_work.u.entry.callsign, callsign))
+        continue;
+
+      if (!plogw->f_console_emu) {
+        plogw->ostream->print(micros() - usec);
+        plogw->ostream->print(" usec matched:");
+        plogw->ostream->print(callsign);
+        plogw->ostream->print(" exch:");
+        plogw->ostream->println(callhist_work.u.entry.exch);
+      }
+      strcpy(getexch, callhist_work.u.entry.exch);
+      return 1;
+    }
   }
+
   if (!plogw->f_console_emu) {
     plogw->ostream->print(micros() - usec);
-    plogw->ostream->println(" usec 1");
+    plogw->ostream->println(" usec not found");
   }
-  return 0;  // not found
+  return 0;
 }
 
 void release_callhist() {

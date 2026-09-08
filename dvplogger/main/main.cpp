@@ -99,10 +99,34 @@ static char latest_subcpu_profile[256] = {0};
 
 void usb_loop_task(void *arg)
 {
+    uint32_t last_acm_ms = 0;
     while(1){
       loop_usb(); // for older USB host library
-      ACMprocess(); // test just receiving      
-      vTaskDelay(10);
+
+      // USB Audio capture needs Usb.Task() serviced every 1 ms.  Keep ACM
+      // CAT processing near its normal 10-ms cadence during audio capture
+      // so it does not consume an unnecessary share of the USB frame budget.
+      if (usb_audio_capture_active()) {
+        const uint32_t now = millis();
+        if ((uint32_t)(now - last_acm_ms) >= 10U) {
+          ACMprocess();
+          last_acm_ms = now;
+        }
+      } else {
+        ACMprocess(); // test just receiving
+        last_acm_ms = millis();
+      }
+
+      // While capturing USB audio do not sleep for a FreeRTOS tick here.
+      // On builds where configTICK_RATE_HZ is 100, vTaskDelay(1) is about
+      // 10 ms and would miss most 1-ms USB audio frames.  The audio Poll()
+      // itself synchronizes to SOF, so merely yield after each pass.
+      if (usb_audio_capture_active()) {
+        taskYIELD();
+      } else {
+        // Keep the existing fast cadence for CDC RTTY keying.
+        vTaskDelay(usb_rtty_fast_service_needed() ? 1 : 10);
+      }
     }
 }
 
@@ -815,6 +839,39 @@ static inline void service_mux_transport()
 
 void loop() {
   time_measure_start_name(PROF_LOOP_TOTAL, "loop");
+
+  // YMODEM fast path -------------------------------------------------------
+  //
+  // A 1K/STX packet at 115200 bps occupies the UART for about 90 ms.
+  // console_process() normally runs near the end of loop(), after display,
+  // network, cluster, decoder and other work.  During a file transfer that
+  // latency can overflow even an enlarged RX ring and cause repeated packet
+  // retries.  While YMODEM is active, dedicate this loop iteration to
+  // draining the console as early and as continuously as possible.
+  //
+  // The Wi-Fi/USB/other application-level tasks are intentionally paused
+  // during the transfer.  Driver/RTOS background work still runs because
+  // delay(0) yields to the scheduler.
+  if (console_ymodem_active()) {
+    time_measure_start_name(PROF_CONSOLE, "console_ymodem");
+    console_process();
+    time_measure_stop(PROF_CONSOLE);
+
+    time_measure_stop(PROF_LOOP_TOTAL);
+    main_loop_revs++;
+
+    // While a packet is being assembled, keep draining aggressively.
+    // A 1K packet at 115200 bps lasts only about 90 ms, well below the WDT
+    // interval.  After ACK/NAK returns the parser to Y_WAIT_START, give IDLE0
+    // one full tick.  This avoids WDT starvation without inserting a 1-tick
+    // gap repeatedly in the middle of an incoming packet.
+    if (console_ymodem_packet_in_progress()) {
+      taskYIELD();
+    } else {
+      vTaskDelay(1);
+    }
+    return;
+  }
 
   time_measure_start_name(PROF_MUX_RECV, "mux_recv");
   service_mux_transport();

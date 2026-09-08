@@ -22,6 +22,8 @@ USBHub::USBHub(USB *p) :
 pUsb(p),
 bAddress(0),
 bNbrPorts(0),
+bParent(0),
+bPort(0),
 //bInitState(0),
 qNextPollTime(0),
 bPollEnable(false) {
@@ -42,6 +44,13 @@ bPollEnable(false) {
 }
 
 uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
+        USB_HOST_SERIAL.print("USBHub Init enter addr=");
+        USB_HOST_SERIAL.print(bAddress);
+        USB_HOST_SERIAL.print(" parent=");
+        USB_HOST_SERIAL.print(parent);
+        USB_HOST_SERIAL.print(" port=");
+        USB_HOST_SERIAL.println(port);
+
         uint8_t buf[32];
         USB_DEVICE_DESCRIPTOR * udd = reinterpret_cast<USB_DEVICE_DESCRIPTOR*>(buf);
         HubDescriptor* hd = reinterpret_cast<HubDescriptor*>(buf);
@@ -51,6 +60,7 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         EpInfo *oldep_ptr = NULL;
         uint8_t len = 0;
         uint16_t cd_len = 0;
+        const char *fail_step = "none";
 
         //USBTRACE("\r\nHub Init Start ");
         //D_PrintHex<uint8_t > (bInitState, 0x80);
@@ -80,6 +90,7 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         p->lowspeed = lowspeed;
 
         // Get device descriptor
+        fail_step = "getDevDescr_addr0_8";
         rcode = pUsb->getDevDescr(0, 0, 8, (uint8_t*)buf);
 
         p->lowspeed = false;
@@ -90,13 +101,43 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         if(rcode) {
                 // Restore p->epinfo
                 p->epinfo = oldep_ptr;
+                USB_HOST_SERIAL.print("[HUBINITFAIL] step=");
+                USB_HOST_SERIAL.print(fail_step);
+                USB_HOST_SERIAL.print(" addr=");
+                USB_HOST_SERIAL.print(bAddress);
+                USB_HOST_SERIAL.print(" parent=");
+                USB_HOST_SERIAL.print(parent);
+                USB_HOST_SERIAL.print(" port=");
+                USB_HOST_SERIAL.print(port);
+                USB_HOST_SERIAL.print(" rcode=0x");
+                USB_HOST_SERIAL.print(rcode, HEX);
+                USB_HOST_SERIAL.print(" HRSL=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rHRSL), HEX);
+                USB_HOST_SERIAL.print(" HIRQ=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rHIRQ), HEX);
+                USB_HOST_SERIAL.print(" USBIRQ=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rUSBIRQ), HEX);
+                USB_HOST_SERIAL.print(" HCTL=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rHCTL), HEX);
+                USB_HOST_SERIAL.print(" MODE=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rMODE), HEX);
+                USB_HOST_SERIAL.print(" PERADDR=");
+                USB_HOST_SERIAL.println(pUsb->regRd(rPERADDR));
                 return rcode;
         }
 
+        USB_HOST_SERIAL.print("USBHub addr0 class=0x");
+        USB_HOST_SERIAL.print(udd->bDeviceClass, HEX);
+        USB_HOST_SERIAL.print(" maxpkt=");
+        USB_HOST_SERIAL.println(udd->bMaxPacketSize0);
+
         // Extract device class from device descriptor
         // If device class is not a hub return
-        if(udd->bDeviceClass != 0x09)
+        if(udd->bDeviceClass != 0x09) {
+                p->epinfo = oldep_ptr;
+                USB_HOST_SERIAL.println("USBHub reject: not hub");
                 return USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
+        }
 
         // Allocate new address according to device class
         bAddress = addrPool.AllocAddress(parent, (udd->bDeviceClass == 0x09) ? true : false, port);
@@ -108,11 +149,34 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         epInfo[0].maxPktSize = udd->bMaxPacketSize0;
 
         // Assign new address to the device
+        fail_step = "setAddr";
         rcode = pUsb->setAddr(0, 0, bAddress);
 
         if(rcode) {
                 // Restore p->epinfo
                 p->epinfo = oldep_ptr;
+                USB_HOST_SERIAL.print("[HUBINITFAIL] step=");
+                USB_HOST_SERIAL.print(fail_step);
+                USB_HOST_SERIAL.print(" addr=");
+                USB_HOST_SERIAL.print(bAddress);
+                USB_HOST_SERIAL.print(" parent=");
+                USB_HOST_SERIAL.print(parent);
+                USB_HOST_SERIAL.print(" port=");
+                USB_HOST_SERIAL.print(port);
+                USB_HOST_SERIAL.print(" rcode=0x");
+                USB_HOST_SERIAL.print(rcode, HEX);
+                USB_HOST_SERIAL.print(" HRSL=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rHRSL), HEX);
+                USB_HOST_SERIAL.print(" HIRQ=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rHIRQ), HEX);
+                USB_HOST_SERIAL.print(" USBIRQ=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rUSBIRQ), HEX);
+                USB_HOST_SERIAL.print(" HCTL=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rHCTL), HEX);
+                USB_HOST_SERIAL.print(" MODE=0x");
+                USB_HOST_SERIAL.print(pUsb->regRd(rMODE), HEX);
+                USB_HOST_SERIAL.print(" PERADDR=");
+                USB_HOST_SERIAL.println(pUsb->regRd(rPERADDR));
                 addrPool.FreeAddress(bAddress);
                 bAddress = 0;
                 return rcode;
@@ -123,13 +187,16 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         // Restore p->epinfo
         p->epinfo = oldep_ptr;
 
-        if(len)
+        if(len) {
+                fail_step = "getDevDescr_newaddr";
                 rcode = pUsb->getDevDescr(bAddress, 0, len, (uint8_t*)buf);
+        }
 
         if(rcode)
                 goto FailGetDevDescr;
 
         // Assign epInfo to epinfo pointer
+        fail_step = "setEpInfoEntry";
         rcode = pUsb->setEpInfoEntry(bAddress, 2, epInfo);
 
         if(rcode)
@@ -139,6 +206,7 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
 
         //        case 1:
         // Get hub descriptor
+        fail_step = "GetHubDescriptor";
         rcode = GetHubDescriptor(0, 8, buf);
 
         if(rcode)
@@ -151,10 +219,12 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
 
         //        case 2:
         // Read configuration Descriptor in Order To Obtain Proper Configuration Value
+        fail_step = "getConfDescr_8";
         rcode = pUsb->getConfDescr(bAddress, 0, 8, 0, buf);
 
         if(!rcode) {
                 cd_len = ucd->wTotalLength;
+                fail_step = "getConfDescr_full";
                 rcode = pUsb->getConfDescr(bAddress, 0, cd_len, 0, buf);
         }
         if(rcode)
@@ -165,6 +235,7 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         {
                 uint8_t buf2[24];
 
+                fail_step = "getConfDescr_sniffer";
                 rcode = pUsb->getConfDescr(bAddress, 0, buf[0], 0, buf2);
 
                 if(rcode)
@@ -172,6 +243,7 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         }
 
         // Set Configuration Value
+        fail_step = "setConf";
         rcode = pUsb->setConf(bAddress, 0, buf[5]);
 
         if(rcode)
@@ -186,6 +258,22 @@ uint8_t USBHub::Init(uint8_t parent, uint8_t port, bool lowspeed) {
 
         pUsb->SetHubPreMask();
         bPollEnable = true;
+        bParent = parent;
+        bPort = port;
+
+        /*
+         * Nested hubs are polled through EP0 GetPortStatus() instead of the
+         * interrupt endpoint. A short settle time avoids touching child ports
+         * immediately after the hub itself has been configured.
+         */
+        if(parent != 0)
+                qNextPollTime = (uint32_t)millis() + 100;
+
+        USB_HOST_SERIAL.print("USBHub configured addr=");
+        USB_HOST_SERIAL.print(bAddress);
+        USB_HOST_SERIAL.print(" ports=");
+        USB_HOST_SERIAL.println(bNbrPorts);
+
         //                bInitState = 0;
         //}
         //bInitState = 0;
@@ -209,6 +297,33 @@ FailSetConfDescr:
         goto Fail;
 
 Fail:
+        USB_HOST_SERIAL.print("[HUBINITFAIL] step=");
+        USB_HOST_SERIAL.print(fail_step);
+        USB_HOST_SERIAL.print(" addr=");
+        USB_HOST_SERIAL.print(bAddress);
+        USB_HOST_SERIAL.print(" parent=");
+        USB_HOST_SERIAL.print(parent);
+        USB_HOST_SERIAL.print(" port=");
+        USB_HOST_SERIAL.print(port);
+        USB_HOST_SERIAL.print(" rcode=0x");
+        USB_HOST_SERIAL.print(rcode, HEX);
+        USB_HOST_SERIAL.print(" HRSL=0x");
+        USB_HOST_SERIAL.print(pUsb->regRd(rHRSL), HEX);
+        USB_HOST_SERIAL.print(" HIRQ=0x");
+        USB_HOST_SERIAL.print(pUsb->regRd(rHIRQ), HEX);
+        USB_HOST_SERIAL.print(" USBIRQ=0x");
+        USB_HOST_SERIAL.print(pUsb->regRd(rUSBIRQ), HEX);
+        USB_HOST_SERIAL.print(" HCTL=0x");
+        USB_HOST_SERIAL.print(pUsb->regRd(rHCTL), HEX);
+        USB_HOST_SERIAL.print(" MODE=0x");
+        USB_HOST_SERIAL.print(pUsb->regRd(rMODE), HEX);
+        USB_HOST_SERIAL.print(" PERADDR=");
+        USB_HOST_SERIAL.println(pUsb->regRd(rPERADDR));
+
+        USB_HOST_SERIAL.print("USBHub Init FAIL addr=");
+        USB_HOST_SERIAL.print(bAddress);
+        USB_HOST_SERIAL.print(" rcode=0x");
+        USB_HOST_SERIAL.println(rcode, HEX);
         USBTRACE("...FAIL\r\n");
         return rcode;
 }
@@ -221,6 +336,8 @@ uint8_t USBHub::Release() {
 
         bAddress = 0;
         bNbrPorts = 0;
+        bParent = 0;
+        bPort = 0;
         qNextPollTime = 0;
         bPollEnable = false;
         return 0;
@@ -232,10 +349,62 @@ uint8_t USBHub::Poll() {
         if(!bPollEnable)
                 return 0;
 
-        if(((int32_t)((uint32_t)millis() - qNextPollTime) >= 0L)) {
-                rcode = CheckHubStatus();
+        if(((int32_t)((uint32_t)millis() - qNextPollTime) < 0L))
+                return 0;
+
+        /*
+         * Nested hubs: avoid the interrupt endpoint entirely. Poll all hub
+         * ports with class control requests and feed change events into the
+         * existing PortStatusChange() state machine.
+         */
+        if(bParent != 0) {
+                for(uint8_t port = 1; port <= bNbrPorts; port++) {
+                        HubEvent evt;
+                        evt.bmEvent = 0;
+                        const uint8_t scan_rc =
+                                GetPortStatus(port, 4, evt.evtBuff);
+
+                        if(scan_rc)
+                                continue;
+
+                        if(evt.bmChange &
+                           bmHUB_PORT_STATUS_C_PORT_CONNECTION) {
+                                rcode = PortStatusChange(port, evt);
+
+                                if(rcode == HUB_ERROR_PORT_HAS_BEEN_RESET) {
+                                        qNextPollTime =
+                                                (uint32_t)millis() + 100;
+                                        return 0;
+                                }
+
+                                if(rcode) {
+                                        qNextPollTime =
+                                                (uint32_t)millis() + 100;
+                                        return rcode;
+                                }
+
+                                qNextPollTime =
+                                        (uint32_t)millis() + 100;
+                                return 0;
+                        }
+
+                        if(evt.bmChange &
+                           bmHUB_PORT_STATUS_C_PORT_RESET) {
+                                evt.bmEvent =
+                                        bmHUB_PORT_EVENT_RESET_COMPLETE;
+                                rcode = PortStatusChange(port, evt);
+                                qNextPollTime =
+                                        (uint32_t)millis() + 100;
+                                return rcode;
+                        }
+                }
+
                 qNextPollTime = (uint32_t)millis() + 100;
+                return 0;
         }
+
+        rcode = CheckHubStatus();
+        qNextPollTime = (uint32_t)millis() + 100;
         return rcode;
 }
 
@@ -246,8 +415,21 @@ uint8_t USBHub::CheckHubStatus() {
 
         rcode = pUsb->inTransfer(bAddress, 1, &read, buf);
 
-        if(rcode)
+        /*
+         * A hub interrupt endpoint normally returns NAK when there is no
+         * pending change bitmap.  Do not return early on NAK: the code below
+         * also contains a fallback scan for CONNECTED-but-disabled ports.
+         * Returning here made that recovery path unreachable exactly when a
+         * child connection-change IRQ was missed.
+         */
+        if(rcode && rcode != hrNAK)
                 return rcode;
+
+        if(rcode == hrNAK) {
+                buf[0] = 0;
+                read = 0;
+                rcode = 0;
+        }
 
         //if (buf[0] & 0x01) // Hub Status Change
         //{
@@ -339,23 +521,152 @@ uint8_t USBHub::PortStatusChange(uint8_t port, HubEvent &evt) {
 
                         ClearPortFeature(HUB_FEATURE_C_PORT_ENABLE, port, 0);
                         ClearPortFeature(HUB_FEATURE_C_PORT_CONNECTION, port, 0);
+
+                        /*
+                         * USB attach debounce.
+                         *
+                         * The IC-705 contains an internal USB hub.  With a
+                         * mechanical unplug/replug, the upstream hub can report
+                         * CONNECT before the contact is stable.  Resetting and
+                         * enumerating immediately lets the internal hub appear,
+                         * only to be followed by a DISCONNECT a few ms later.
+                         *
+                         * Require about 100 ms of continuously stable
+                         * CONNECTION before issuing PORT_RESET.  Limit the
+                         * observation window to about 300 ms; if it never
+                         * stabilizes, leave the port alone and let the next
+                         * real/synthetic connection event retry it.
+                         */
+                        {
+                                uint8_t stable_samples = 0;
+                                for(uint8_t attempt = 0;
+                                    attempt < 90 && stable_samples < 30;
+                                    attempt++) {
+                                        delay(10);
+
+                                        HubEvent db_evt;
+                                        db_evt.bmEvent = 0;
+                                        const uint8_t db_rcode =
+                                                GetPortStatus(port, 4, db_evt.evtBuff);
+
+                                        if(db_rcode) {
+                                                stable_samples = 0;
+                                                continue;
+                                        }
+
+                                        const bool connected =
+                                                (db_evt.bmStatus &
+                                                 bmHUB_PORT_STATUS_PORT_CONNECTION) != 0;
+                                        const bool connection_changed =
+                                                (db_evt.bmChange &
+                                                 bmHUB_PORT_STATUS_C_PORT_CONNECTION) != 0;
+
+                                        if(connection_changed) {
+                                                ClearPortFeature(
+                                                        HUB_FEATURE_C_PORT_CONNECTION,
+                                                        port, 0);
+                                                stable_samples = 0;
+                                        } else if(connected) {
+                                                stable_samples++;
+                                        } else {
+                                                stable_samples = 0;
+                                        }
+                                }
+
+                                if(stable_samples < 30)
+                                        return 0;
+                        }
+
                         SetPortFeature(HUB_FEATURE_PORT_RESET, port, 0);
                         bResetInitiated = true;
                         return HUB_ERROR_PORT_HAS_BEEN_RESET;
 
                         // Device disconnected event
-                case bmHUB_PORT_EVENT_DISCONNECT:
+                case bmHUB_PORT_EVENT_DISCONNECT: {
+                        HubEvent before_clear_evt;
+                        before_clear_evt.bmEvent = 0;
+                        const uint8_t before_status_rc =
+                                GetPortStatus(port, 4, before_clear_evt.evtBuff);
+
+                        /*
+                         * External-hub DISCONNECT debounce.
+                         *
+                         * Keep the current session unless the upstream port
+                         * remains continuously disconnected for ~100 ms.
+                         * CONNECT-side debounce is left unchanged.
+                         */
+                        if(bParent == 0) {
+                                bool reconnected = false;
+                                uint8_t last_rc = before_status_rc;
+                                HubEvent last_evt = before_clear_evt;
+
+                                for(uint8_t si = 0; si < 10; si++) {
+                                        delay(10);
+
+                                        last_evt.bmEvent = 0;
+                                        last_rc = GetPortStatus(port, 4,
+                                                last_evt.evtBuff);
+
+                                        if(last_rc == 0 &&
+                                           (last_evt.bmStatus &
+                                            bmHUB_PORT_STATUS_PORT_CONNECTION)) {
+                                                reconnected = true;
+                                                break;
+                                        }
+                                }
+
+                                if(reconnected) {
+                                        ClearPortFeature(
+                                                HUB_FEATURE_C_PORT_CONNECTION,
+                                                port, 0);
+                                        return 0;
+                                }
+                        }
+
+                        /*
+                         * A hub change interrupt reports that a connection
+                         * changed, but by the time we process it the device may
+                         * already have reconnected.  In that case the queued
+                         * DISCONNECT is stale.  Releasing the current device
+                         * here races with the new session and can destroy a
+                         * just-started enumeration.
+                         *
+                         * If the current port status is CONNECTED, acknowledge
+                         * the old change bit and immediately re-enter the normal
+                         * CONNECT path using the fresh status.  Do not release
+                         * any address from the old DISCONNECT event.
+                         */
+                        if(before_status_rc == 0 &&
+                           (before_clear_evt.bmStatus &
+                            bmHUB_PORT_STATUS_PORT_CONNECTION)) {
+                                ClearPortFeature(
+                                        HUB_FEATURE_C_PORT_CONNECTION,
+                                        port, 0);
+
+                                bResetInitiated = false;
+
+                                HubEvent fresh_connect_evt = before_clear_evt;
+                                fresh_connect_evt.bmChange |=
+                                        bmHUB_PORT_STATUS_C_PORT_CONNECTION;
+                                return PortStatusChange(port, fresh_connect_evt);
+                        }
+
                         ClearPortFeature(HUB_FEATURE_C_PORT_ENABLE, port, 0);
                         ClearPortFeature(HUB_FEATURE_C_PORT_CONNECTION, port, 0);
+
                         bResetInitiated = false;
 
-                        UsbDeviceAddress a;
-                        a.devAddress = 0;
-                        a.bmHub = 0;
-                        a.bmParent = bAddress;
-                        a.bmAddress = port;
-                        pUsb->ReleaseDevice(a.devAddress);
+                        /*
+                         * A non-hub child address encodes parent+port, but a
+                         * child hub address encodes parent+hub-number instead.
+                         * Release by physical parent/port so nested hubs (e.g.
+                         * the IC-705 internal hub) are not left consumed.
+                         */
+                        UsbDeviceAddress parent_addr;
+                        parent_addr.devAddress = bAddress;
+                        pUsb->ReleaseDeviceAtPort(parent_addr.bmAddress, port);
                         return 0;
+                }
 
                         // Reset complete event
                 case bmHUB_PORT_EVENT_RESET_COMPLETE:
@@ -365,9 +676,11 @@ uint8_t USBHub::PortStatusChange(uint8_t port, HubEvent &evt) {
 
                         delay(20);
 
-                        a.devAddress = bAddress;
+                        UsbDeviceAddress reset_parent;
+                        reset_parent.devAddress = bAddress;
 
-                        pUsb->Configuring(a.bmAddress, port, (evt.bmStatus & bmHUB_PORT_STATUS_PORT_LOW_SPEED));
+                        pUsb->Configuring(reset_parent.bmAddress, port,
+                                          (evt.bmStatus & bmHUB_PORT_STATUS_PORT_LOW_SPEED));
                         bResetInitiated = false;
                         break;
 

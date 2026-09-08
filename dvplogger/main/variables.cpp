@@ -46,7 +46,9 @@ union qso_union_tag qso;  // data is delimited by space in the file
 
 struct score score;
 int verbose = 0;  // debug info level
-int enable_usb_keying = 0;  // if enabled, DTR ON/OFF keying in IC-705
+// RTTY PTT-to-first-bit delay.  This is deliberately global rather than
+// rig-specific; the FSK output itself is selected per rig with CW:0..4.
+int rtty_ptt_lead_ms = 100;
 // to test suppress limiting JA temporalily
 //int timeout_rtc = 0;
 int timeout_interval = 0;
@@ -61,9 +63,9 @@ int f_printkey=0;
 int f_show_clock = 0;
 DateTime rtctime, ntptime;
 
-const char *mode_str[NMODEID] = { "CW", "CW-R", "LSB", "USB", "FM", "AM", "RTTY" };
+const char *mode_str[NMODEID] = { "CW", "CW-R", "LSB", "USB", "FM", "AM", "RTTY", "RTTY-R" };
 // mode code given from rig ci-v
-int modetype[NMODEID] = { LOG_MODETYPE_CW, LOG_MODETYPE_CW, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_DG };  // 0 .. CW 1.. phone 2.. DIGI
+int modetype[NMODEID] = { LOG_MODETYPE_CW, LOG_MODETYPE_CW, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_DG, LOG_MODETYPE_DG };  // RTTY and RTTY-R are both digital/FSK
 const char *modetype_str[4] = { "*", "CW", "PH", "DG" };
 /// call buffer
 struct logwindow logw;

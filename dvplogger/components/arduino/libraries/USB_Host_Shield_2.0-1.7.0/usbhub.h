@@ -170,6 +170,8 @@ class USBHub : USBDeviceConfig {
 
         uint8_t bAddress; // address
         uint8_t bNbrPorts; // number of ports
+        uint8_t bParent;   // physical parent hub number used by Configuring()
+        uint8_t bPort;     // physical upstream port on that parent
         //        uint8_t bInitState; // initialization state variable
         uint32_t qNextPollTime; // next poll time
         bool bPollEnable; // poll enable flag
@@ -202,6 +204,10 @@ public:
 
         virtual bool DEVCLASSOK(uint8_t klass) {
                 return (klass == 0x09);
+        }
+
+        virtual bool HUBPORTOK(uint8_t parent, uint8_t port) {
+                return bAddress && bParent == parent && bPort == port;
         }
 
 };

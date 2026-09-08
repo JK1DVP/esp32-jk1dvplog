@@ -81,6 +81,7 @@
 #define INFO_DISP_SAT_AOS 5  // checking satellite time to next AOS
 #define INFO_DISP_SIGNAL 7
 #define INFO_DISP_SUMMARY 8
+#define INFO_DISP_RTTY_RX 10  // decoded RTTY text from rig USB second serial port
 
 
 #define BAND_MASK_WARC 0b1110000000000000
@@ -124,7 +125,7 @@
 #define LOG_SandP 0
 
 //#define N_RIG 9
-#define N_RIG 21
+#define N_RIG 26
 //#define N_RIG 5
 // number of radios in operation so3r = 3 
 #define N_RADIO 3
@@ -145,7 +146,7 @@
 #define N_MULTI (1346+14+47) // ACAG + ALLJA
 
 #define NBANDMODE (N_BAND*2)
-#define NMODEID 7
+#define NMODEID 8
 
 //#define N_CONTEST 25
 #define N_CONTEST 46
@@ -187,9 +188,11 @@ struct rig {
   // now usually rig#0 is attached to Serial1 rig#1 is attached to Serial2 and rig#3 is attached to Serial3(Software Serial), and are configured to attached to the hardware pins for civport_num, on the select_rig
   bool civport_reversed; // true if the serial port is reversed
   int civport_baud; // baudrate of the civport if nonzero if negative flip polarity
-  int cwport; // cw output port 0/1
+  int cwport; // CW output: 0 LED, 1 KEY1, 2 KEY2, 3 USB DTR, 4 USB RTS
+  int fskport; // RTTY FSK output; -1 falls back to cwport for legacy rigs
+  int rtty_polarity; // -1 legacy/global, 0 normal, 1 reverse
   int rig_type ; // 0 IC-705 1 IC-9700 2 FT-991  3 QCX mini 4 Manual
-  int pttmethod; // how to ptt 0 port 0/1, 2... civ/cat
+  int pttmethod; // additional PTT: 0/1 don't care, 2 CAT/CI-V, 3 USB DTR, 4 USB RTS
   int rig_spec_idx; // index number of the rig specification
   char rig_identification[6]; // rig identification number (although cat control share the same protocol (Yaesu/Kenwood/Icom) behavior of each rig differs, so receive ID by ID; command (yaesu) and store them here.)
   int transverter_enable[NMAX_TRANSVERTER];
@@ -282,7 +285,7 @@ struct radio {
   int power_bak ; // save original power setting when tune
   char tm_loaded[20]; // time of the QSO loaded from SD
   int seqnr_loaded; // sequential number of the QSO loaded from SD
-  char opmode_loaded[6];
+  char opmode_loaded[8];
   unsigned int freq_loaded;
 
   int qsodata_loaded ; // if set, indicates QSO data is loaded from previous data for editing
@@ -336,7 +339,7 @@ struct radio {
   int ptt_stat_prev; // to check previous status of ptt in ci-v/cat function
   // these interractive buffer the first byte is current editing pointer, second byte size of the buffer from the third byte contents
 
-  char opmode[6];
+  char opmode[8];
   // True after a real rig mode has been received, selected, or recalled.
   // Until then the current-mode field is displayed as "----" rather than
   // showing stale/uninitialised opmode storage.
@@ -346,6 +349,10 @@ struct radio {
   struct check_entry_list check_entry_list; // partial and dupe check 
 
   bool cq[4]; // current operation 1 cq 0 s&p      /// cq[modetype]
+
+  // CW S&P transmit offset control. xit_offset_hz is persistent via settings.
+  bool xit_enabled;
+  int xit_offset_hz;
 
   int multi; // multiplier id of the qso (start from zero)
   int modetype; // operation mode type 0 not defined (initial state) 1 cw 2 ph  3 digi
@@ -416,6 +423,7 @@ struct logwindow {
   char f_antalt_switched; // 1 when switched antenna (in order not to use the next reading. Reset zero when read the first. 
   
   int f_esm ; // 0: default 1: ESM (Enter Sends Message) mode
+  int wipe_key_swap; // 0: Alt-W=wipe QSO, Ctrl-W=clear field; 1: swapped
   
   int show_smeter; // if set, show Smeter value (or dBm) on the number of QSO area
 

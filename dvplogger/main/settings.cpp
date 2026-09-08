@@ -189,6 +189,41 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
   n_settings_dict++;
 
+  settings_dict[n_settings_dict].name = "rtty_msg_1";
+  settings_dict[n_settings_dict].value = (void *)plogw->rtty_msg[0] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "rtty_msg_2";
+  settings_dict[n_settings_dict].value = (void *)plogw->rtty_msg[1] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "rtty_msg_3";
+  settings_dict[n_settings_dict].value = (void *)plogw->rtty_msg[2] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "rtty_msg_4";
+  settings_dict[n_settings_dict].value = (void *)plogw->rtty_msg[3] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "rtty_msg_5";
+  settings_dict[n_settings_dict].value = (void *)plogw->rtty_msg[4] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "rtty_msg_6";
+  settings_dict[n_settings_dict].value = (void *)plogw->rtty_msg[5] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "rtty_msg_7";
+  settings_dict[n_settings_dict].value = (void *)plogw->rtty_msg[6] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "dupechk_mask";
   settings_dict[n_settings_dict].value = (void *)&plogw->mask;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
@@ -421,6 +456,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
 
+  settings_dict[n_settings_dict].name = "wipe_key_swap";
+  settings_dict[n_settings_dict].value = (void *)&plogw->wipe_key_swap;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "show_smeter";
   settings_dict[n_settings_dict].value = (void *)&plogw->show_smeter;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
@@ -428,6 +468,23 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
 
   settings_dict[n_settings_dict].name = "show_qso_interval";
   settings_dict[n_settings_dict].value = (void *)&plogw->show_qso_interval;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  // CW S&P XIT offsets are persistent per radio.  XITON/XITOFF only
+  // control whether the saved offset is applied; XITRESET clears it.
+  settings_dict[n_settings_dict].name = "xit_offset_radio0";
+  settings_dict[n_settings_dict].value = (void *)&radio_list[0].xit_offset_hz;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "xit_offset_radio1";
+  settings_dict[n_settings_dict].value = (void *)&radio_list[1].xit_offset_hz;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "xit_offset_radio2";
+  settings_dict[n_settings_dict].value = (void *)&radio_list[2].xit_offset_hz;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
 
@@ -469,6 +526,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
     settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
     n_settings_dict++;
   }
+
+  settings_dict[n_settings_dict].name = "rtty_lead_ms";
+  settings_dict[n_settings_dict].value = (void *)&rtty_ptt_lead_ms;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
 
   settings_dict[n_settings_dict].name = "sat_tle_url";
   settings_dict[n_settings_dict].value = (void *)sat_tle_url;

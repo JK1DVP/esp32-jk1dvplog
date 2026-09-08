@@ -94,6 +94,19 @@ uint8_t BTD::ConfigureDevice(uint8_t parent, uint8_t port, bool lowspeed) {
         if(rcode)
                 goto FailGetDevDescr;
 
+        /*
+         * A hub must be left untouched for USBHub::Init().  The old code
+         * allocated an address first and then reset/released it in FailHub;
+         * that can disturb the same enumeration pass and prevent the hub
+         * driver from claiming the device.
+         */
+        if (udd->bDeviceClass == 0x09) {
+#ifdef DEBUG_USB_HOST
+                Notify(PSTR("\r\nBTD skip USB hub at addr0"), 0x80);
+#endif
+                return USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
+        }
+
         bAddress = addrPool.AllocAddress(parent, false, port); // Allocate new address according to device class
 
         if(!bAddress) {
@@ -103,9 +116,6 @@ uint8_t BTD::ConfigureDevice(uint8_t parent, uint8_t port, bool lowspeed) {
                 return USB_ERROR_OUT_OF_ADDRESS_SPACE_IN_POOL;
         }
 
-        if (udd->bDeviceClass == 0x09) // Some dongles have an USB hub inside
-                goto FailHub;
-
         epInfo[0].maxPktSize = udd->bMaxPacketSize0; // Extract Max Packet Size from device descriptor
         epInfo[1].epAddr = udd->bNumConfigurations; // Steal and abuse from epInfo structure to save memory
 
@@ -113,15 +123,6 @@ uint8_t BTD::ConfigureDevice(uint8_t parent, uint8_t port, bool lowspeed) {
         PID = udd->idProduct;
 
         return USB_ERROR_CONFIG_REQUIRES_ADDITIONAL_RESET;
-
-FailHub:
-#ifdef DEBUG_USB_HOST
-        Notify(PSTR("\r\nPlease create a hub instance in your code: \"USBHub Hub1(&Usb);\""), 0x80);
-#endif
-        pUsb->setAddr(bAddress, 0, 0); // Reset address
-        rcode = USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
-        Release();
-        return rcode;
 
 FailGetDevDescr:
 #ifdef DEBUG_USB_HOST

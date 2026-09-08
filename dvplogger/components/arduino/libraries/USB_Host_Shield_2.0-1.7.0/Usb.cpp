@@ -477,6 +477,16 @@ void USB::Task(void) //USB state machine
         uint8_t rcode;
         uint8_t tmpdata;
         static uint32_t delay = 0;
+
+        /*
+         * Root-port SE0 diagnostics only.
+         * Do not debounce, resample, delay, or otherwise alter the
+         * existing disconnect decision.
+         */
+        static uint32_t se0_diag_event = 0;
+        static uint32_t se0_diag_last_non_se0_ms = 0;
+        static uint8_t se0_diag_prev_vbus = 0xff;
+
         //USB_DEVICE_DESCRIPTOR buf;
         bool lowspeed = false;
 
@@ -517,6 +527,66 @@ void USB::Task(void) //USB state machine
 	}
 
 	tmpdata = getVbusState();
+        const uint32_t se0_diag_now = millis();
+
+        /*
+         * A single transient SE0 has been observed while a QMX remains
+         * physically connected.  Before tearing down a running USB session,
+         * resample D+/D- up to three times.  Read J/K directly from HRSL first
+         * so that a transient SE0 does not make busprobe() switch MODE into the
+         * disconnected state.
+         */
+        if(tmpdata == SE0 &&
+           (usb_task_state & USB_STATE_MASK) != USB_STATE_DETACHED) {
+                bool se0_resample_recovered = false;
+
+                for(uint8_t attempt = 1; attempt <= 3; ++attempt) {
+                        ::delay(2);
+                        regWr(rHCTL, bmSAMPLEBUS);
+
+                        const uint32_t sample_started = millis();
+                        while(!(regRd(rHCTL) & bmSAMPLEBUS)) {
+                                if((uint32_t)(millis() - sample_started) >= 10U)
+                                        break;
+                        }
+
+                        const uint8_t sample_hrsl = regRd(rHRSL);
+                        const uint8_t sample_jk =
+                            sample_hrsl & (bmJSTATUS | bmKSTATUS);
+
+                        USB_HOST_SERIAL.print("[SE0RESAMPLE] attempt=");
+                        USB_HOST_SERIAL.print(attempt);
+                        USB_HOST_SERIAL.print(" t=");
+                        USB_HOST_SERIAL.print(millis());
+                        USB_HOST_SERIAL.print(" state=0x");
+                        USB_HOST_SERIAL.print(usb_task_state, HEX);
+                        USB_HOST_SERIAL.print(" HRSL=0x");
+                        USB_HOST_SERIAL.print(sample_hrsl, HEX);
+                        USB_HOST_SERIAL.print(" JK=0x");
+                        USB_HOST_SERIAL.println(sample_jk, HEX);
+
+                        if(sample_jk == bmJSTATUS || sample_jk == bmKSTATUS) {
+                                busprobe();
+                                tmpdata = getVbusState();
+                                se0_resample_recovered =
+                                    (tmpdata == FSHOST || tmpdata == LSHOST);
+                                if(se0_resample_recovered)
+                                        break;
+                        }
+                }
+
+                if(se0_resample_recovered) {
+                        USB_HOST_SERIAL.print(
+                            "[SE0RESAMPLE] recovered: ignore transient SE0, vbus=0x");
+                        USB_HOST_SERIAL.println(tmpdata, HEX);
+                } else {
+                        USB_HOST_SERIAL.println(
+                            "[SE0RESAMPLE] confirmed SE0 after 3 samples");
+                }
+        }
+
+        if(tmpdata != SE0)
+                se0_diag_last_non_se0_ms = millis();
 
 	/*
 	static uint32_t debug_last = 0;
@@ -543,6 +613,43 @@ void USB::Task(void) //USB state machine
                         break;
                 case SE0: //disconnected
 		  if((usb_task_state & USB_STATE_MASK) != USB_STATE_DETACHED) {
+                    ++se0_diag_event;
+
+                    /* Capture MAX3421E state before init()/Release(). */
+                    const uint8_t se0_hrsl = regRd(rHRSL);
+                    const uint8_t se0_hirq = regRd(rHIRQ);
+                    const uint8_t se0_usbirq = regRd(rUSBIRQ);
+                    const uint8_t se0_hctl = regRd(rHCTL);
+                    const uint8_t se0_mode = regRd(rMODE);
+                    const uint8_t se0_peraddr = regRd(rPERADDR);
+
+                    USB_HOST_SERIAL.print("[SE0DIAG] event=");
+                    USB_HOST_SERIAL.print(se0_diag_event);
+                    USB_HOST_SERIAL.print(" t=");
+                    USB_HOST_SERIAL.print(se0_diag_now);
+                    USB_HOST_SERIAL.print(" state=0x");
+                    USB_HOST_SERIAL.print(usb_task_state, HEX);
+                    USB_HOST_SERIAL.print(" vbus=0x");
+                    USB_HOST_SERIAL.print(tmpdata, HEX);
+                    USB_HOST_SERIAL.print(" prev_vbus=0x");
+                    USB_HOST_SERIAL.print(se0_diag_prev_vbus, HEX);
+                    USB_HOST_SERIAL.print(" since_non_se0_ms=");
+                    USB_HOST_SERIAL.print((uint32_t)(se0_diag_now - se0_diag_last_non_se0_ms));
+                    USB_HOST_SERIAL.print(" HRSL=0x");
+                    USB_HOST_SERIAL.print(se0_hrsl, HEX);
+                    USB_HOST_SERIAL.print(" HRSL_result=0x");
+                    USB_HOST_SERIAL.print(se0_hrsl & 0x0f, HEX);
+                    USB_HOST_SERIAL.print(" HIRQ=0x");
+                    USB_HOST_SERIAL.print(se0_hirq, HEX);
+                    USB_HOST_SERIAL.print(" USBIRQ=0x");
+                    USB_HOST_SERIAL.print(se0_usbirq, HEX);
+                    USB_HOST_SERIAL.print(" HCTL=0x");
+                    USB_HOST_SERIAL.print(se0_hctl, HEX);
+                    USB_HOST_SERIAL.print(" MODE=0x");
+                    USB_HOST_SERIAL.print(se0_mode, HEX);
+                    USB_HOST_SERIAL.print(" PERADDR=");
+                    USB_HOST_SERIAL.println(se0_peraddr);
+
 		    USB_HOST_SERIAL.print(		    
 					  "USB::Task SE0: returning to INITIALIZE from 0x"
 							    );
@@ -575,6 +682,8 @@ void USB::Task(void) //USB state machine
                         }
                         break;
         }// switch( tmpdata
+
+        se0_diag_prev_vbus = tmpdata;
 
         for(uint8_t i = 0; i < USB_NUMDEVICES; i++)
                 if(devConfig[i])
@@ -804,14 +913,44 @@ uint8_t USB::Configuring(uint8_t parent, uint8_t port, bool lowspeed) {
         p->epinfo = &epInfo;
 
         p->lowspeed = lowspeed;
-        // Get device descriptor
-        rcode = getDevDescr(0, 0, sizeof (USB_DEVICE_DESCRIPTOR), (uint8_t*)buf);
+
+        /*
+         * At the default USB address the host only knows EP0's provisional
+         * 8-byte packet size.  Some composite devices (notably QMX) NAK an
+         * immediate 18-byte GET_DESCRIPTOR after reconnect.  Read the first
+         * 8 bytes first, learn bMaxPacketSize0, then request the complete
+         * device descriptor.  Retry transient NAKs during both stages.
+         */
+        for(uint8_t retry = 0; retry < 10; retry++) {
+                rcode = getDevDescr(0, 0, 8, (uint8_t*)buf);
+                if(rcode != hrNAK)
+                        break;
+                USB_HOST_SERIAL.print("USB Configuring getDevDescr(8) NAK retry ");
+                USB_HOST_SERIAL.println(retry + 1);
+                delay(50);
+        }
+
+        if(!rcode) {
+                epInfo.maxPktSize = udd->bMaxPacketSize0;
+                p->epinfo = &epInfo;
+
+                for(uint8_t retry = 0; retry < 10; retry++) {
+                        rcode = getDevDescr(0, 0, sizeof (USB_DEVICE_DESCRIPTOR),
+                                           (uint8_t*)buf);
+                        if(rcode != hrNAK)
+                                break;
+                        USB_HOST_SERIAL.print("USB Configuring getDevDescr(18) NAK retry ");
+                        USB_HOST_SERIAL.println(retry + 1);
+                        delay(50);
+                }
+        }
 
         // Restore p->epinfo
         p->epinfo = oldep_ptr;
 
         if(rcode) {
-                //printf("Configuring error: Can't get USB_DEVICE_DESCRIPTOR\r\n");
+                USB_HOST_SERIAL.print("USB Configuring getDevDescr failed rcode=0x");
+                USB_HOST_SERIAL.println(rcode, HEX);
                 return rcode;
         }
 
@@ -823,6 +962,20 @@ uint8_t USB::Configuring(uint8_t parent, uint8_t port, bool lowspeed) {
         uint16_t pid = udd->idProduct;
         uint8_t klass = udd->bDeviceClass;
         uint8_t subklass = udd->bDeviceSubClass;
+
+        USB_HOST_SERIAL.print("USB Configuring dev VID=");
+        USB_HOST_SERIAL.print(vid, HEX);
+        USB_HOST_SERIAL.print(" PID=");
+        USB_HOST_SERIAL.print(pid, HEX);
+        USB_HOST_SERIAL.print(" class=0x");
+        USB_HOST_SERIAL.print(klass, HEX);
+        USB_HOST_SERIAL.print(" subclass=0x");
+        USB_HOST_SERIAL.print(subklass, HEX);
+        USB_HOST_SERIAL.print(" parent=");
+        USB_HOST_SERIAL.print(parent);
+        USB_HOST_SERIAL.print(" port=");
+        USB_HOST_SERIAL.println(port);
+
         // Attempt to configure if VID/PID or device class matches with a driver
         // Qualify with subclass too.
         //
@@ -833,7 +986,15 @@ uint8_t USB::Configuring(uint8_t parent, uint8_t port, bool lowspeed) {
                 if(!devConfig[devConfigIndex]) continue; // no driver
                 if(devConfig[devConfigIndex]->GetAddress()) continue; // consumed
                 if(devConfig[devConfigIndex]->DEVSUBCLASSOK(subklass) && (devConfig[devConfigIndex]->VIDPIDOK(vid, pid) || devConfig[devConfigIndex]->DEVCLASSOK(klass))) {
+                        USB_HOST_SERIAL.print("USB Configuring class-match driver=");
+                        USB_HOST_SERIAL.print(devConfigIndex);
+                        USB_HOST_SERIAL.print(" current_addr=");
+                        USB_HOST_SERIAL.println(devConfig[devConfigIndex]->GetAddress());
                         rcode = AttemptConfig(devConfigIndex, parent, port, lowspeed);
+                        USB_HOST_SERIAL.print("USB Configuring class-match result driver=");
+                        USB_HOST_SERIAL.print(devConfigIndex);
+                        USB_HOST_SERIAL.print(" rcode=0x");
+                        USB_HOST_SERIAL.println(rcode, HEX);
                         if(rcode != USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED)
                                 break;
                 }
@@ -867,9 +1028,97 @@ uint8_t USB::Configuring(uint8_t parent, uint8_t port, bool lowspeed) {
         return rcode;
 }
 
+uint8_t USB::ReleaseDeviceAtPort(uint8_t parent, uint8_t port) {
+        /*
+         * First look for a hub driver that explicitly owns this physical
+         * parent/port.  Hub USB addresses do not encode the upstream port.
+         */
+        for(uint8_t i = 0; i < USB_NUMDEVICES; i++) {
+                if(!devConfig[i])
+                        continue;
+                if(!devConfig[i]->HUBPORTOK(parent, port))
+                        continue;
+
+                const uint8_t addr = devConfig[i]->GetAddress();
+                USB_HOST_SERIAL.print("[USBREL] hub parent=");
+                USB_HOST_SERIAL.print(parent);
+                USB_HOST_SERIAL.print(" port=");
+                USB_HOST_SERIAL.print(port);
+                USB_HOST_SERIAL.print(" addr=");
+                USB_HOST_SERIAL.println(addr);
+                return ReleaseDevice(addr);
+        }
+
+        /*
+         * Ordinary non-hub device addresses do encode parent+port.
+         */
+        UsbDeviceAddress a;
+        a.devAddress = 0;
+        a.bmHub = 0;
+        a.bmParent = parent;
+        a.bmAddress = port;
+
+        AddressPool &addrPool = GetAddressPool();
+        if(!addrPool.GetUsbDevicePtr(a.devAddress)) {
+                USB_HOST_SERIAL.print("[USBREL] no-device parent=");
+                USB_HOST_SERIAL.print(parent);
+                USB_HOST_SERIAL.print(" port=");
+                USB_HOST_SERIAL.print(port);
+                USB_HOST_SERIAL.print(" addr=");
+                USB_HOST_SERIAL.println(a.devAddress);
+                return 0;
+        }
+
+        USB_HOST_SERIAL.print("[USBREL] device parent=");
+        USB_HOST_SERIAL.print(parent);
+        USB_HOST_SERIAL.print(" port=");
+        USB_HOST_SERIAL.print(port);
+        USB_HOST_SERIAL.print(" addr=");
+        USB_HOST_SERIAL.println(a.devAddress);
+        return ReleaseDevice(a.devAddress);
+}
+
 uint8_t USB::ReleaseDevice(uint8_t addr) {
         if(!addr)
                 return 0;
+
+        /*
+         * If a hub disappears, release class-driver instances attached below
+         * it before releasing the hub itself.  AddressPool::FreeAddress()
+         * already frees descendant address records, but the corresponding
+         * USBDeviceConfig objects used to retain their old bAddress/ready
+         * state.  On reconnect those stale instances were therefore skipped,
+         * and a nested hub (for example the IC-705 internal 0451:2046 hub
+         * behind an external hub) could fall through to ACM/BTD probing and
+         * fail to enumerate.
+         *
+         * USB addresses encode the immediate parent hub in bmParent.  Release
+         * direct children one at a time; recursion handles any nested hubs.
+         * Restart the scan after each release because Release() changes the
+         * child's GetAddress() value to zero.
+         */
+        UsbDeviceAddress parent_addr;
+        parent_addr.devAddress = addr;
+        if(parent_addr.bmHub) {
+                bool released_child;
+                do {
+                        released_child = false;
+                        for(uint8_t i = 0; i < USB_NUMDEVICES; i++) {
+                                if(!devConfig[i]) continue;
+
+                                const uint8_t child_addr_raw = devConfig[i]->GetAddress();
+                                if(!child_addr_raw || child_addr_raw == addr) continue;
+
+                                UsbDeviceAddress child_addr;
+                                child_addr.devAddress = child_addr_raw;
+                                if(child_addr.bmParent == parent_addr.bmAddress) {
+                                        ReleaseDevice(child_addr_raw);
+                                        released_child = true;
+                                        break;
+                                }
+                        }
+                } while(released_child);
+        }
 
         for(uint8_t i = 0; i < USB_NUMDEVICES; i++) {
                 if(!devConfig[i]) continue;

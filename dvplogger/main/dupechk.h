@@ -24,6 +24,13 @@
 
 unsigned char bandmode(struct radio *radio) ;
 unsigned char bandmode_param(int bandid,int modetype) ;
+// Normalize only well-known portable suffixes for exact DUPE/CALLHIST matching.
+// The original callsign used for display/logging is never modified.
+bool normalize_dupe_callsign(const char *src, char *dst, size_t dst_size);
+bool dupe_callsign_equal(const char *a, const char *b);
+// Partial callsign match.  If pattern contains '-', each dash is one
+// unknown character; otherwise preserve the historical substring match.
+bool dupe_callsign_partial_match(const char *candidate, const char *pattern);
 bool dupe_check_nocallhist(const char *call, byte bandmode, byte mask) ;
 bool dupe_check_with_exch(const char *call, byte bandmode, byte mask,
                           char *exch, size_t exch_size);
@@ -57,6 +64,8 @@ void entry_makedupe_bulk_subcpu(char *s);
 void finish_makedupe_bulk_subcpu();
 void begin_makedupe_subcpu(unsigned char mask);
 void finish_makedupe_subcpu();
+void start_finish_makedupe_subcpu();
+bool poll_finish_makedupe_subcpu();
 void note_makedupe_accepted_maincpu();
 bool dupechk_remote_query_pending();
 bool dupechk_remote_ack_received();

@@ -39,6 +39,7 @@
 #include "misc.h"
 #include "processes.h"
 #include "cmd_interp.h"
+#include "usb_host.h"
 
 
 //////////////////////////////
@@ -67,6 +68,8 @@ int wptr_cw_onoff_buf = 0, rptr_cw_onoff_buf = 0;
 //int f_so2r_chgstat_tx = 0;  // nonzero if changing so2r transmit requested
 //int f_so2r_chgstat_rx = 0;  // nonzero if changing so2r receive requested
 int f_transmission = 0;     // 0 nothing   1 force transmission on active trx 2 force stop transmission on active trx
+static volatile uint32_t cw_xit_start_hold_until_ms = 0;
+volatile bool f_rtty_usb_lead_pending = false; // start USB RTTY lead only after PTT ON is issued
 
 // Manual keyboard CW must not follow the automatic SO2R sequence TX radio.
 // -1 means normal/automatic operation: use so2r.radio_tx().
@@ -192,6 +195,16 @@ void set_tone_keying(struct radio *radio) {
 }
 
 
+static void keying_port(int port, int on)
+{
+  switch (port) {
+  case 0: digitalWrite(LED, on); break;
+  case 1: digitalWrite(CW_KEY1, on); break;
+  case 2: digitalWrite(CW_KEY2, on); break;
+  case 3: case 4: usb_keying_request((uint8_t)port, on != 0); break;
+  }
+}
+
 void keying(int on)
 // set key in appropriate port / SO2Rmini
 
@@ -211,6 +224,10 @@ void keying(int on)
           break;
         case 2:  // CW_KEY2
           digitalWrite(CW_KEY2, on);
+          break;
+        case 3:  // USB CDC ACM DTR
+        case 4:  // USB CDC ACM RTS
+          usb_keying_request(radio->rig_spec->cwport, on);
           break;
       }
       // make sure all other hardware ports are off
@@ -240,6 +257,10 @@ void keying(int on)
           case 2:  // CW_KEY2
             digitalWrite(CW_KEY2, on);
 	    //	    console->print("2");	    
+            break;
+          case 3:  // USB CDC ACM DTR
+          case 4:  // USB CDC ACM RTS
+            usb_keying_request(radio->rig_spec->cwport, on);
             break;
         }
       }
@@ -296,14 +317,26 @@ void interrupt_cw_send() {
   // shift+F1: TX設定 RX CQじゃない方。 CQ 出す 終わったらRX CQ だしたものに。
   // 上記から、TXを設定できる必要は必ずしもない。
 
-  if (enable_usb_keying) return;  // do not perform the following keying process if keying from usb
-
   //  radio = &radio_list[plogw->so2r_tx];  // set tx radio
   if (so2r.radio_mode == SO2R::RADIO_MODE_SO2R &&
       manual_cw_radio >= 0 && manual_cw_radio < N_RADIO) {
     radio = &radio_list[manual_cw_radio];
   } else {
     radio = so2r.radio_tx();
+  }
+
+  // For transient Yaesu TX CLAR, give the queued CAT command a short window
+  // to reach the rig before the first CW element.  This does not block loop().
+  if (cw_xit_start_hold_until_ms != 0) {
+    uint32_t now = millis();
+    if ((int32_t)(now - cw_xit_start_hold_until_ms) < 0) return;
+    cw_xit_start_hold_until_ms = 0;
+  }
+
+  // USB RTTY defers ETX until the last scheduled 45.45-baud cell has
+  // actually completed.  Turn PTT off only after loop_usb() reports done.
+  if (usb_rtty_take_tx_done()) {
+    f_transmission = 2;
   }
 
   int ms;
@@ -343,15 +376,42 @@ void interrupt_cw_send() {
 	//	f_so2r_chgstat_rx = 3;
 	//	break;
       case CW_MSCMD_END_OF_MSG:  // end of a message reached
+        request_finish_xit_cw_message(radio);
 	so2r.tx_msg_finished();
 	break;
 	// RTTY stx/etx
-      case CW_MSCMD_RTTY_STX:             // STX start transmission in active TX (in SO2R)
-	f_transmission = 1;  // start transmission
+      case CW_MSCMD_RTTY_STX: {           // STX start transmission in active TX (in SO2R)
+	f_transmission = 1;  // request PTT ON in the main loop
+        if (rtty_ptt_lead_ms < 0) rtty_ptt_lead_ms = 0;
+        if (rtty_ptt_lead_ms > 2000) rtty_ptt_lead_ms = 2000;
+        const uint8_t fskport = (uint8_t)rig_fsk_port(radio->rig_spec);
+        if (!radio->f_tone_keying && (fskport == 3 || fskport == 4)) {
+          // Do not start the MARK lead here.  PTT is only issued later by
+          // Control_TX_process() in the main loop.  Starting the lead here
+          // can consume the whole lead interval while the main loop is busy,
+          // clipping the beginning of the callsign/exchange.
+          f_rtty_usb_lead_pending = true;
+          // Hold the CW/RTTY producer until Control_TX_process() has issued
+          // PTT ON and starts the real lead interval.
+          cw_count_ms = 2000;
+        } else {
+          const bool line_asserted = true ^ rig_rtty_invert(radio->rig_spec);
+          keying_port(fskport, line_asserted ? 1 : 0);
+          cw_count_ms = rtty_ptt_lead_ms;
+        }
 	break;
-      case CW_MSCMD_RTTY_ETX:             // ETX end transmission in active TX (in SO2R)
-	f_transmission = 2;  // stop transmission
+      }
+      case CW_MSCMD_RTTY_ETX: {           // ETX end transmission in active TX (in SO2R)
+        const uint8_t fskport = (uint8_t)rig_fsk_port(radio->rig_spec);
+        if (!radio->f_tone_keying && (fskport == 3 || fskport == 4)) {
+          // Keep PTT on until the USB scheduler has completed the final
+          // 0.5-stop-bit MARK cell.
+          if (!usb_rtty_end_request(fskport)) f_transmission = 2;
+        } else {
+	  f_transmission = 2;
+        }
 	break;
+      }
 
 	// tone keying PTT
       case CW_MSCMD_TONEKEY_ON: // in tone keying breakin ptt on
@@ -376,8 +436,13 @@ void interrupt_cw_send() {
 	      set_tone(2,1);
 
 	    } else {
-	      // digitalWrite(LED, 0);
-	      keying(0);
+              const uint8_t fskport = (uint8_t)rig_fsk_port(radio->rig_spec);
+              if (fskport == 3 || fskport == 4)
+                usb_rtty_symbol_request(fskport, false, (uint32_t)(-ms) * 1000UL);
+              else {
+                const bool line_asserted = false ^ rig_rtty_invert(radio->rig_spec);
+                keying_port(fskport, line_asserted ? 1 : 0);
+              }
 	    }
 
 	    break;
@@ -407,8 +472,13 @@ void interrupt_cw_send() {
 	      //ledcWrite(LEDC_CHANNEL_0, 2047);  // 50% duty tone
 	      set_tone(1,1);
 	    } else {
-	      //digitalWrite(LED, 1);
-	      keying(1);
+              const uint8_t fskport = (uint8_t)rig_fsk_port(radio->rig_spec);
+              if (fskport == 3 || fskport == 4)
+                usb_rtty_symbol_request(fskport, true, (uint32_t)ms * 1000UL);
+              else {
+                const bool line_asserted = true ^ rig_rtty_invert(radio->rig_spec);
+                keying_port(fskport, line_asserted ? 1 : 0);
+              }
 	    }
 
 	    break;
@@ -588,6 +658,47 @@ int send_the_dits_and_dahs(const char *cw_to_send) {
   }
 }
 
+// Planned Baudot-cell diagnostic.  Record exact logical cells generated by
+// send_bits() and dump them later from the command interpreter.
+struct RttyBaudotDiagCell {
+  uint8_t code;
+  uint8_t bit_index;  // 0=start, 1..5=D0..D4, 6=stop, 7=half-stop
+  uint8_t mark;
+  uint16_t duration_ms;
+};
+static constexpr uint16_t RTTY_BAUDOT_DIAG_LEN = 256;
+static RttyBaudotDiagCell rtty_baudot_diag[RTTY_BAUDOT_DIAG_LEN];
+static volatile uint16_t rtty_baudot_diag_w = 0;
+static volatile uint16_t rtty_baudot_diag_n = 0;
+
+void RTTYbaudotDiagReset() { rtty_baudot_diag_w = 0; rtty_baudot_diag_n = 0; }
+
+static void rtty_baudot_diag_add(uint8_t code, uint8_t bit_index, bool mark, uint16_t duration_ms) {
+  const uint16_t w = rtty_baudot_diag_w;
+  rtty_baudot_diag[w] = { (uint8_t)(code & 0x1f), bit_index, (uint8_t)(mark ? 1 : 0), duration_ms };
+  rtty_baudot_diag_w = (uint16_t)((w + 1) % RTTY_BAUDOT_DIAG_LEN);
+  if (rtty_baudot_diag_n < RTTY_BAUDOT_DIAG_LEN) ++rtty_baudot_diag_n;
+}
+
+void RTTYbaudotDiagDump(Print *out) {
+  if (!out) out = console;
+  const uint16_t n = rtty_baudot_diag_n;
+  uint16_t idx = (uint16_t)((rtty_baudot_diag_w + RTTY_BAUDOT_DIAG_LEN - n) % RTTY_BAUDOT_DIAG_LEN);
+  out->printf("RTTY BAUDOT planned cells=%u (S=SPACE M=MARK)\n", n);
+  for (uint16_t i=0; i<n; ++i) {
+    const RttyBaudotDiagCell &c = rtty_baudot_diag[idx];
+    char bitname[8];
+    const char *name = bitname;
+    if (c.bit_index == 0) name = "START";
+    else if (c.bit_index >= 1 && c.bit_index <= 5) { snprintf(bitname, sizeof(bitname), "D%u", c.bit_index - 1); }
+    else if (c.bit_index == 6) name = "STOP";
+    else name = "STOP.5";
+    out->printf("BAUDOT %u code=%02u bit=%s state=%c duration=%u ms\n",
+                i, c.code, name, c.mark ? 'M' : 'S', c.duration_ms);
+    idx = (uint16_t)((idx + 1) % RTTY_BAUDOT_DIAG_LEN);
+  }
+}
+
 // send baudot bits to the key
 void send_bits(byte code, int fig, int *figures) {
   // check figures
@@ -600,17 +711,17 @@ void send_bits(byte code, int fig, int *figures) {
       send_bits(31, 0, figures);  // LTRS
     }
   }
+  const uint8_t ita2_code = code & 0x1f;
   code = (code << 1) | 0b1000000;  // add start bit (at LSB) and stop bit // start bit is 0(space) stop bit is 1(mark)
   int ms_elem, ms;
   ms_elem = 22;  // single element of 45.45 baud = 22ms
 
   for (int i = 0; i < 7; i++) {
     // check LSB
-    if (code & 0x1) {
-      ms = ms_elem;
-    } else {
-      ms = -ms_elem;
-    }
+    const bool mark = (code & 0x1) != 0;
+    if (mark) ms = ms_elem;
+    else ms = -ms_elem;
+    rtty_baudot_diag_add(ita2_code, (uint8_t)i, mark, (uint16_t)ms_elem);
     code = code >> 1;  // shift code for the next bit
     //    while ((wptr_cw_onoff_buf + 1) % LEN_CW_ONOFF_BUF == rptr_cw_onoff_buf)
     //      ;
@@ -620,6 +731,7 @@ void send_bits(byte code, int fig, int *figures) {
 
   //  while ((wptr_cw_onoff_buf + 1) % LEN_CW_ONOFF_BUF == rptr_cw_onoff_buf)
   //    ;
+  rtty_baudot_diag_add(ita2_code, 7, true, (uint16_t)(ms_elem / 2));
   cw_onoff_buf[wptr_cw_onoff_buf] = ms_elem / 2;  // add half bit stop (mark)
   wptr_cw_onoff_buf = (wptr_cw_onoff_buf + 1) % LEN_CW_ONOFF_BUF;
 }
@@ -630,6 +742,11 @@ void send_baudot(byte ascii, int *figures)
 {
 
   switch (ascii) {
+    // Diagnostic-only explicit LTRS character.
+    case 0x1f:
+      *figures = 0;
+      send_bits(31, 0, figures);
+      break;
     // followings are letters
     case 0x00: send_bits(0, *figures, figures); break;
     case 'E': send_bits(1, 0, figures); break;
@@ -1007,6 +1124,39 @@ char append_cwbuf_convchar(char c)
   return c;
 }
 
+static void append_cwbuf_raw(uint8_t c) {
+  cw_send_buf[wptr_cw_send_buf] = (char)c;
+  wptr_cw_send_buf = (wptr_cw_send_buf + 1) % LEN_CW_SEND_BUF;
+  cw_send_update = 1;
+}
+
+void append_rtty_test1(char ch, int n) {
+  // Diagnostic path: bypass append_cwbuf_convchar()/macro expansion so that
+  // the non-printable ITA2 LTRS control code (0x1f) reaches send_baudot().
+  clear_manual_cw_radio();
+  append_cwbuf_raw((uint8_t)CW_MSCMD_RTTY_STX_CHR);
+  append_cwbuf_raw(0x1f);
+  append_cwbuf_raw(0x1f);
+  append_cwbuf_raw(0x1f);
+  for (int i = 0; i < n; ++i) append_cwbuf_raw((uint8_t)ch);
+  append_cwbuf_raw((uint8_t)CW_MSCMD_RTTY_ETX_CHR);
+}
+
+void append_rtty_test_text(const char *s) {
+  if (s == NULL) return;
+  clear_manual_cw_radio();
+  append_cwbuf_raw((uint8_t)CW_MSCMD_RTTY_STX_CHR);
+  while (*s) {
+    unsigned char c = (unsigned char)*s++;
+    if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 'a' + 'A');
+    // Keep the diagnostic command intentionally literal and Baudot-safe.
+    // CR/LF are accepted by send_baudot(); other control bytes are skipped.
+    if (c == '\r' || c == '\n' || (c >= 0x20 && c <= 0x7e))
+      append_cwbuf_raw(c);
+  }
+  append_cwbuf_raw((uint8_t)CW_MSCMD_RTTY_ETX_CHR);
+}
+
 void append_cwbuf(char c) {
   c=append_cwbuf_convchar(c);
   if (c=='\0') return ;
@@ -1068,41 +1218,38 @@ char rtty_memory_string[51];  // yaesu max 50 char icom max 70 chars
 void set_rttymemory_string(struct radio *radio, int num, char *s)
 // set rtty data memory num (1~8)
 {
-  char buf[100];
-
   char c;
+  (void)radio;
+  (void)num;
   // clear buffer
   *rtty_memory_string = '\0';
   char *sp;
   // set buffer (recursively)
   set_rttymemory_string_buf(s);
-  // issue set command to set string to id
-  // icom
-  // 1A 02 CH TEXT(2~71)  total of 73 bytes max
 
   if (!plogw->f_console_emu) {
     plogw->ostream->print("rtty_memory_string:");
     plogw->ostream->println(rtty_memory_string);
   }
-  switch (radio->rig_spec->cat_type) {
-    case 0:  // icom
-      // ic-705 cannot set rtty memory buffer so send them to cwbuf as CW
-      // special character 0x1　STX will start transmission and 0x2 ETX will stop transmission
-      append_cwbuf('[');  // start transmission
-      sp = rtty_memory_string;
-      while (1) {
-        c = *sp++;
-        if (c == 0x00) break;
-        append_cwbuf(c);
-      }
-      append_cwbuf(']');  // end transmission
-      break;
-    case 1:  // cat
-      sprintf(buf, "EM0%d%s;", num, rtty_memory_string);
-      if (!plogw->f_console_emu) plogw->ostream->println(buf);
-      send_cat_cmd(radio, buf);
-      break;
+
+  // All radios use the DVPlogger local Baudot/FSK generator.
+  // The physical MARK/SPACE output is selected by FSK:0..4.
+  // If FSK is omitted, legacy rigs fall back to CW:0..4.
+  // '[' and ']' are the existing local RTTY STX/ETX markers.
+  append_cwbuf('[');  // start transmission
+  sp = rtty_memory_string;
+  while (1) {
+    c = *sp++;
+    if (c == 0x00) break;
+    // CR/LF are valid ITA2 control characters, but append_cwbuf()
+    // deliberately drops non-printable characters.  Preserve them
+    // so $L can reach send_baudot().
+    if (c == '\r' || c == '\n')
+      append_cwbuf_raw((uint8_t)c);
+    else
+      append_cwbuf(c);
   }
+  append_cwbuf(']');  // end transmission
 }
 
 void set_rttymemory_string_buf(char *s) {
@@ -1133,8 +1280,12 @@ void set_rttymemory_string_buf(char *s) {
         case 'C':  // his callsign
           set_rttymemory_string_buf(radio->callsign + 2);
           break;
-        case 'W':  // send his exchange
-          set_rttymemory_string_buf(plogw->sent_exch + 2);
+        case 'W':  // send my contest exchange (band-dependent token expansion)
+          {
+            char exch_buf[100];
+            expand_sent_exch(exch_buf, sizeof(exch_buf));
+            set_rttymemory_string_buf(exch_buf);
+          }
           break;
         case 'J':  // jcc nr send
           set_rttymemory_string_buf(plogw->jcc + 2);
@@ -1156,15 +1307,16 @@ void set_rttymemory_string_buf(char *s) {
         case 'N':  // send my name
           set_rttymemory_string_buf(plogw->my_name + 2);
           break;
-        case 'L':  // new line (RTTY) CR (or LF?)
-          set_rttymemory_string_buf("\n");
+        case 'L':  // new line (RTTY): CR + LF
+          set_rttymemory_string_buf("\r\n");
           break;
       }
       idx = strlen(rtty_memory_string);
 
       stat = 0;
     } else {
-      // append
+      // append (leave one byte for the terminating NUL)
+      if (idx >= (int)sizeof(rtty_memory_string) - 1) break;
       rtty_memory_string[idx++] = c;
       rtty_memory_string[idx] = '\0';
     }
@@ -1360,6 +1512,10 @@ void append_cwbuf_string(const char *s) {
 
   struct radio *radio;
   radio=so2r.radio_tx();
+  if (prepare_xit_for_cw_message(radio)) {
+    // USB CAT is queued, so let loop() service it before the ticker keys CW.
+    cw_xit_start_hold_until_ms = millis() + 30;
+  }
   // check f_tone  
   if (radio->f_tone_keying ) {
     // F2A
@@ -1396,6 +1552,8 @@ void delete_cwbuf() {
 
 void cancel_keying(struct radio *radio) // here radio indicates currently transmitting radio
 {
+  cw_xit_start_hold_until_ms = 0;
+  request_finish_xit_cw_message(radio);
   clear_cwbuf();
   rptr_cw_onoff_buf = wptr_cw_onoff_buf; // read pointer go to write pointer
   cw_count_ms=0;

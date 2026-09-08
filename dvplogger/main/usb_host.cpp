@@ -28,6 +28,7 @@
 #include "variables.h"
 #include "usb_host.h"
 #include "usb_cat_transport.h"
+#include "uac_pcm2901.h"
 
 #include <cdcftdi.h>  // serial adapter
 #include <cp2105.h>
@@ -38,6 +39,7 @@
 #include "ui.h"
 #include "cat.h"
 #include "cw_keying.h"
+#include "display.h"
 #include "so2r.h"
 #include "mux_transport.h"
 #include "pgmstrings_usbhost.h"
@@ -47,6 +49,7 @@
 #endif
 
 USB Usb;
+PCMAudioCapture PcmAudio(&Usb);
 USBHub Hub(&Usb);  // 使用するハブの数だけ定義しておく
 USBHub Hub2(&Usb);
 
@@ -57,6 +60,267 @@ void printepdescr( uint8_t* descr_ptr );
 void printunkdescr( uint8_t* descr_ptr );
 uint8_t getconfdescr( uint8_t addr, uint8_t conf );
 void printProgStr(const char* str);
+
+
+// ---------------------------------------------------------------------------
+// RTTY decoded-text display and conservative callsign autofill
+// ---------------------------------------------------------------------------
+static constexpr uint8_t RTTY_RX_ROWS = 5;
+static constexpr uint8_t RTTY_RX_COLS = 20;
+static char rtty_rx_line[RTTY_RX_ROWS][RTTY_RX_COLS + 1] = {{0}};
+static uint8_t rtty_rx_col = 0;
+static bool rtty_rx_last_cr = false;
+static char rtty_rx_token[LEN_CALLSIGN + 1] = "";
+static uint8_t rtty_rx_token_len = 0;
+
+// Independent terminal log buffer.  The OLED display wraps every 20 columns,
+// but the serial log should preserve the decoder's original CR/LF line so it
+// is useful for contest logging and post-mortem debugging.
+static constexpr size_t RTTY_TERM_LINE_MAX = 160;
+static char rtty_term_line[RTTY_TERM_LINE_MAX + 1] = "";
+static size_t rtty_term_line_len = 0;
+static bool rtty_term_last_cr = false;
+
+struct RttyCallCandidate {
+  char call[LEN_CALLSIGN + 1];
+  uint32_t when_ms;
+};
+static constexpr uint8_t RTTY_CALL_HISTORY = 8;
+static RttyCallCandidate rtty_call_history[RTTY_CALL_HISTORY] = {};
+static uint8_t rtty_call_history_count = 0;
+static char rtty_last_autofill[N_RADIO][LEN_CALLSIGN + 1] = {{0}};
+
+static void rtty_decoder_display_snapshot() {
+  char text[RTTY_RX_ROWS * (RTTY_RX_COLS + 1) + 1];
+  size_t pos = 0;
+  for (uint8_t row = 0; row < RTTY_RX_ROWS; ++row) {
+    const size_t n = strnlen(rtty_rx_line[row], RTTY_RX_COLS);
+    if (pos + n + 2 > sizeof(text)) break;
+    memcpy(text + pos, rtty_rx_line[row], n);
+    pos += n;
+    if (row + 1 < RTTY_RX_ROWS) text[pos++] = '\n';
+  }
+  text[pos] = '\0';
+  upd_display_rtty_decoder(text);
+}
+
+static void rtty_decoder_newline() {
+  for (uint8_t row = 0; row + 1 < RTTY_RX_ROWS; ++row)
+    memcpy(rtty_rx_line[row], rtty_rx_line[row + 1], RTTY_RX_COLS + 1);
+  memset(rtty_rx_line[RTTY_RX_ROWS - 1], 0, RTTY_RX_COLS + 1);
+  rtty_rx_col = 0;
+}
+
+static void rtty_terminal_log_flush() {
+  if (rtty_term_line_len == 0 || plogw == NULL || plogw->ostream == NULL) return;
+  rtty_term_line[rtty_term_line_len] = '\0';
+  plogw->ostream->printf("RTTY RX: %s\r\n", rtty_term_line);
+  rtty_term_line_len = 0;
+  rtty_term_line[0] = '\0';
+}
+
+static void rtty_terminal_log_feed(uint8_t c) {
+  if (c == '\r') {
+    rtty_terminal_log_flush();
+    rtty_term_last_cr = true;
+    return;
+  }
+  if (c == '\n') {
+    if (!rtty_term_last_cr) rtty_terminal_log_flush();
+    rtty_term_last_cr = false;
+    return;
+  }
+  rtty_term_last_cr = false;
+
+  if (c == 0x08 || c == 0x7f) {
+    if (rtty_term_line_len > 0) rtty_term_line[--rtty_term_line_len] = '\0';
+    return;
+  }
+  if (c == '\t') c = ' ';
+  if (c < 0x20 || c > 0x7e) return;
+
+  // Do not lose a very long decoder line.  Emit a continued chunk rather than
+  // silently truncating it; normal contest exchanges are far shorter than this.
+  if (rtty_term_line_len >= RTTY_TERM_LINE_MAX) rtty_terminal_log_flush();
+  rtty_term_line[rtty_term_line_len++] = (char)c;
+  rtty_term_line[rtty_term_line_len] = '\0';
+}
+
+static bool rtty_callsign_candidate(const char *s) {
+  if (s == NULL) return false;
+  const size_t n = strlen(s);
+  if (n < 4 || n > LEN_CALLSIGN) return false;
+  int alpha = 0, digit = 0, slash = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const unsigned char c = (unsigned char)s[i];
+    if (c >= 'A' && c <= 'Z') alpha++;
+    else if (c >= '0' && c <= '9') digit++;
+    else if (c == '/') slash++;
+    else return false;
+  }
+  if (alpha < 2 || digit < 1 || slash > 1) return false;
+  if (s[0] == '/' || s[n - 1] == '/') return false;
+  // Common RTTY report/control tokens are not callsigns.
+  if (strcmp(s, "5NN") == 0 || strcmp(s, "599") == 0) return false;
+  if (plogw != NULL && plogw->my_callsign[1] != 0 &&
+      strcasecmp(s, plogw->my_callsign + 2) == 0) return false;
+  return true;
+}
+
+static int rtty_call_distance(const char *a, const char *b) {
+  if (strlen(a) != strlen(b)) return 99;
+  int d = 0;
+  for (size_t i = 0; a[i]; ++i) {
+    if (a[i] != b[i] && ++d > 2) return d;
+  }
+  return d;
+}
+
+static void rtty_try_autofill_callsign(const char *new_call) {
+  if (!rtty_callsign_candidate(new_call)) return;
+  if (plogw != NULL && plogw->ostream != NULL)
+    plogw->ostream->printf("RTTY CALL candidate=%s\r\n", new_call);
+
+  // Newest candidate is the cluster anchor.  This naturally forgets a
+  // previous QSO as soon as a sufficiently different recent callsign arrives.
+  if (rtty_call_history_count < RTTY_CALL_HISTORY) rtty_call_history_count++;
+  for (int i = rtty_call_history_count - 1; i > 0; --i)
+    rtty_call_history[i] = rtty_call_history[i - 1];
+  strlcpy(rtty_call_history[0].call, new_call, sizeof(rtty_call_history[0].call));
+  rtty_call_history[0].when_ms = millis();
+
+  const size_t n = strlen(new_call);
+  const uint32_t now = millis();
+  int cluster[RTTY_CALL_HISTORY];
+  int nc = 0;
+  for (uint8_t i = 0; i < rtty_call_history_count; ++i) {
+    if ((uint32_t)(now - rtty_call_history[i].when_ms) > 15000U) continue;
+    if (rtty_call_distance(new_call, rtty_call_history[i].call) <= 2)
+      cluster[nc++] = i;
+  }
+  // One decode is too easy to get wrong.  Wait for a repeat/similar decode.
+  if (nc < 2) {
+    plogw->ostream->printf("RTTY CALL consensus=WAIT samples=%d\r\n", nc);
+    return;
+  }
+
+  char consensus[LEN_CALLSIGN + 1];
+  for (size_t pos = 0; pos < n; ++pos) {
+    int counts[37] = {0}; // A-Z,0-9,/
+    for (int j = 0; j < nc; ++j) {
+      char c = rtty_call_history[cluster[j]].call[pos];
+      int k = (c >= 'A' && c <= 'Z') ? c - 'A' :
+              (c >= '0' && c <= '9') ? 26 + c - '0' :
+              (c == '/') ? 36 : -1;
+      if (k >= 0) counts[k]++;
+    }
+    int best = -1, bestn = 0;
+    for (int k = 0; k < 37; ++k) {
+      if (counts[k] > bestn) { bestn = counts[k]; best = k; }
+    }
+    if (bestn * 2 <= nc) consensus[pos] = '-';
+    else if (best < 26) consensus[pos] = (char)('A' + best);
+    else if (best < 36) consensus[pos] = (char)('0' + best - 26);
+    else consensus[pos] = '/';
+  }
+  consensus[n] = '\0';
+  plogw->ostream->printf("RTTY CALL consensus=%s samples=%d%s\r\n",
+                         consensus, nc,
+                         strchr(consensus, '-') ? " PARTIAL" : "");
+
+  struct radio *radio = so2r.radio_selected();
+  if (radio == NULL) return;
+  const int ridx = (int)(radio - radio_list);
+  if (ridx < 0 || ridx >= N_RADIO) return;
+
+  // Continue refining only an empty field or a value that this decoder put
+  // there.  Any operator edit immediately takes ownership and stops autofill.
+  const char *current = radio->callsign + 2;
+  if (*current != '\0' && strcmp(current, rtty_last_autofill[ridx]) != 0) {
+    rtty_last_autofill[ridx][0] = '\0';
+    return;
+  }
+  if (strcmp(current, consensus) == 0) return;
+
+  strlcpy(rtty_last_autofill[ridx], consensus, sizeof(rtty_last_autofill[ridx]));
+  set_callsign_and_request_dupe(radio, consensus, true);
+  plogw->ostream->printf("RTTY CALL autofill=%s samples=%d%s\n",
+                         consensus, nc,
+                         strchr(consensus, '-') ? " PARTIAL-only" : "");
+}
+
+static void rtty_decoder_finish_token() {
+  if (rtty_rx_token_len == 0) return;
+  rtty_rx_token[rtty_rx_token_len] = '\0';
+  rtty_try_autofill_callsign(rtty_rx_token);
+  rtty_rx_token_len = 0;
+  rtty_rx_token[0] = '\0';
+}
+
+static void rtty_decoder_feed_byte(uint8_t c) {
+  rtty_terminal_log_feed(c);
+
+  if (c == '\r') {
+    rtty_decoder_finish_token();
+    rtty_decoder_newline();
+    rtty_rx_last_cr = true;
+    return;
+  }
+  if (c == '\n') {
+    rtty_decoder_finish_token();
+    if (!rtty_rx_last_cr) rtty_decoder_newline();
+    rtty_rx_last_cr = false;
+    return;
+  }
+  rtty_rx_last_cr = false;
+
+  if (c == 0x08 || c == 0x7f) {
+    if (rtty_rx_col > 0) {
+      --rtty_rx_col;
+      rtty_rx_line[RTTY_RX_ROWS - 1][rtty_rx_col] = '\0';
+    }
+    if (rtty_rx_token_len > 0) rtty_rx_token[--rtty_rx_token_len] = '\0';
+    return;
+  }
+
+  if (c == '\t') c = ' ';
+  if (c < 0x20 || c > 0x7e) return;
+  if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+
+  if (rtty_rx_col >= RTTY_RX_COLS) rtty_decoder_newline();
+  rtty_rx_line[RTTY_RX_ROWS - 1][rtty_rx_col++] = (char)c;
+  rtty_rx_line[RTTY_RX_ROWS - 1][rtty_rx_col] = '\0';
+
+  // Callsign token chars.  Everything else terminates a token.  '-' is not
+  // accepted from the decoder itself; it is reserved for our uncertainty
+  // marker generated by consensus.
+  if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/') {
+    if (rtty_rx_token_len < LEN_CALLSIGN)
+      rtty_rx_token[rtty_rx_token_len++] = (char)c;
+  } else {
+    rtty_decoder_finish_token();
+  }
+}
+
+void RTTYDecoderFeedText(const char *text, bool append_newline) {
+  if (text == NULL) return;
+  while (*text) rtty_decoder_feed_byte((uint8_t)*text++);
+  if (append_newline) rtty_decoder_feed_byte('\n');
+  // A terminal injection often ends without whitespace.  Treat end-of-call as
+  // a token boundary without changing the visual line unless requested.
+  rtty_decoder_finish_token();
+  rtty_decoder_display_snapshot();
+}
+
+void RTTYDecoderResetAutofill() {
+  rtty_call_history_count = 0;
+  rtty_rx_token_len = 0;
+  rtty_rx_token[0] = '\0';
+  rtty_term_line_len = 0;
+  rtty_term_line[0] = '\0';
+  rtty_term_last_cr = false;
+  memset(rtty_last_autofill, 0, sizeof(rtty_last_autofill));
+}
 
 void PrintAllAddresses(UsbDevice *pdev)
 {
@@ -470,11 +734,347 @@ class ACMAsyncOper : public CDCAsyncOper {
 
 static constexpr uint16_t QMX_USB_VID = 0x0483;
 static constexpr uint16_t QMX_USB_PID = 0xA34C;
+static constexpr uint16_t ATS_MINI_USB_VID = 0x303A;
+static constexpr uint16_t ATS_MINI_USB_PID = 0x1001;
+
+// CDC ACM line-state keying is deferred out of the 1-ms CW ticker.  A USB
+// control transfer must never be issued directly from interrupt_cw_send().
+struct UsbKeyingEvent {
+  uint8_t cwport;
+  uint8_t on;
+};
+static constexpr uint8_t USB_KEYING_QUEUE_LEN = 32;
+static volatile UsbKeyingEvent usb_keying_queue[USB_KEYING_QUEUE_LEN];
+static volatile uint8_t usb_keying_head = 0;
+static volatile uint8_t usb_keying_tail = 0;
+static volatile uint32_t usb_keying_drops = 0;
+static uint8_t usb_acm_line_state = 0; // bit0 DTR, bit1 RTS
+// CDC class requests use wIndex=interface.  IC-705 is composite, so keep
+// the keying control-interface selectable until its USB(A) interface is
+// identified from descriptors/diagnostic probing.
+static uint8_t usb_acm_key_iface = 0;
+extern ACM Acm;
+
+// RTTY over USB DTR/RTS needs much tighter timing than CW.  Do not issue
+// SET_CONTROL_LINE_STATE from the 1-ms ticker.  Instead queue complete
+// Baudot symbol cells here and let loop_usb() start each cell only after the
+// previous cell has actually occupied its requested duration.
+struct UsbRttyEvent {
+  uint8_t kind;       // 0=symbol, 1=end-of-message
+  uint8_t cwport;     // 3=DTR, 4=RTS
+  uint8_t mark;       // logical MARK state for kind=0
+  uint32_t duration_us;
+};
+static constexpr uint8_t USB_RTTY_QUEUE_LEN = 64;
+static volatile UsbRttyEvent usb_rtty_queue[USB_RTTY_QUEUE_LEN];
+static volatile uint8_t usb_rtty_head = 0;
+static volatile uint8_t usb_rtty_tail = 0;
+static volatile uint32_t usb_rtty_drops = 0;
+static volatile bool usb_rtty_tx_done = false;
+static bool usb_rtty_active = false;
+static uint32_t usb_rtty_due_us = 0;
+static uint32_t usb_rtty_last_boundary_us = 0;
+static uint32_t usb_rtty_last_duration_us = 0;
+static uint8_t usb_rtty_last_mark = 1;
+// Logical RTTY MARK/SPACE to physical CDC control-line polarity.
+// false: logical MARK=asserted (DTR/RTS=1), true: logical MARK=deasserted.
+// Default true is required for correct Baudot decoding with the tested
+// IC-705 USB(A) DTR RTTY keying setup.  This changes only the logical
+// MARK/SPACE-to-control-line polarity; it does not change the RF frequency pair.
+static volatile bool usb_rtty_invert = true;
+static bool usb_rtty_active_invert = true;
+
+// DTR/RTS transport is selected automatically: CDC ACM for Icom/generic
+// radios, CP2105 Standard COM (port 1) for Yaesu USB CAT radios.
+static bool usb_control_line_ready();
+static uint8_t usb_control_line_apply(uint8_t new_state);
+static uint8_t usb_control_line_state();
+
+struct UsbRttyTimingSample {
+  uint32_t dt_us;
+  uint32_t expected_us;
+  uint8_t mark;
+  uint8_t rcode;
+};
+static constexpr uint8_t USB_RTTY_TIMING_LEN = 64;
+static UsbRttyTimingSample usb_rtty_timing[USB_RTTY_TIMING_LEN];
+static uint8_t usb_rtty_timing_w = 0;
+static uint8_t usb_rtty_timing_n = 0;
+static uint32_t usb_rtty_timing_min = 0xffffffffUL;
+static uint32_t usb_rtty_timing_max = 0;
+static uint32_t usb_rtty_timing_maxerr = 0;
+
+static bool usb_time_reached(uint32_t now, uint32_t due)
+{
+  return (int32_t)(now - due) >= 0;
+}
+
+static void usb_rtty_timing_reset()
+{
+  usb_rtty_timing_w = 0;
+  usb_rtty_timing_n = 0;
+  usb_rtty_timing_min = 0xffffffffUL;
+  usb_rtty_timing_max = 0;
+  usb_rtty_timing_maxerr = 0;
+  usb_rtty_last_boundary_us = 0;
+  usb_rtty_last_duration_us = 0;
+  usb_rtty_last_mark = 1;
+}
+
+static void usb_rtty_record_boundary(uint32_t now, uint8_t next_mark, uint8_t rcode)
+{
+  if (usb_rtty_last_boundary_us != 0) {
+    const uint32_t dt = now - usb_rtty_last_boundary_us;
+    const uint32_t expected = usb_rtty_last_duration_us;
+    const uint32_t err = (dt > expected) ? (dt - expected) : (expected - dt);
+    UsbRttyTimingSample &sm = usb_rtty_timing[usb_rtty_timing_w];
+    sm.dt_us = dt;
+    sm.expected_us = expected;
+    sm.mark = usb_rtty_last_mark;
+    sm.rcode = rcode;
+    usb_rtty_timing_w = static_cast<uint8_t>((usb_rtty_timing_w + 1) % USB_RTTY_TIMING_LEN);
+    if (usb_rtty_timing_n < USB_RTTY_TIMING_LEN) ++usb_rtty_timing_n;
+    if (dt < usb_rtty_timing_min) usb_rtty_timing_min = dt;
+    if (dt > usb_rtty_timing_max) usb_rtty_timing_max = dt;
+    if (err > usb_rtty_timing_maxerr) usb_rtty_timing_maxerr = err;
+  }
+  usb_rtty_last_boundary_us = now;
+  usb_rtty_last_mark = next_mark ? 1 : 0;
+}
+
+static bool usb_rtty_enqueue(uint8_t kind, uint8_t cwport, bool mark, uint32_t duration_us)
+{
+  if (cwport != 3 && cwport != 4) return false;
+  const uint8_t head = usb_rtty_head;
+  const uint8_t next = static_cast<uint8_t>((head + 1) % USB_RTTY_QUEUE_LEN);
+  if (next == usb_rtty_tail) {
+    ++usb_rtty_drops;
+    return false;
+  }
+  usb_rtty_queue[head].kind = kind;
+  usb_rtty_queue[head].cwport = cwport;
+  usb_rtty_queue[head].mark = mark ? 1 : 0;
+  usb_rtty_queue[head].duration_us = duration_us;
+  usb_rtty_head = next;
+  return true;
+}
+
+bool usb_rtty_begin(uint8_t cwport, uint32_t lead_ms, bool invert)
+{
+  if (cwport != 3 && cwport != 4) return false;
+  // A new STX starts a fresh RTTY timing epoch.
+  usb_rtty_tail = usb_rtty_head;
+  usb_rtty_active = false;
+  usb_rtty_tx_done = false;
+  usb_rtty_timing_reset();
+  usb_rtty_active_invert = invert;
+  return usb_rtty_enqueue(0, cwport, true, lead_ms * 1000UL);
+}
+
+bool usb_rtty_symbol_request(uint8_t cwport, bool mark, uint32_t duration_us)
+{
+  if (duration_us == 0) duration_us = 1;
+  return usb_rtty_enqueue(0, cwport, mark, duration_us);
+}
+
+bool usb_rtty_end_request(uint8_t cwport)
+{
+  return usb_rtty_enqueue(1, cwport, true, 0);
+}
+
+bool usb_rtty_take_tx_done()
+{
+  if (!usb_rtty_tx_done) return false;
+  usb_rtty_tx_done = false;
+  return true;
+}
+
+void USBRTTYsetInvert(bool invert, Print *out)
+{
+  usb_rtty_invert = invert;
+  if (!out) out = console;
+  if (out) out->printf("USB RTTY invert=%d (logical MARK -> line %s)\n",
+                       usb_rtty_invert ? 1 : 0,
+                       usb_rtty_invert ? "deasserted" : "asserted");
+}
+
+bool USBRTTYgetInvert()
+{
+  return usb_rtty_invert;
+}
+
+bool usb_rtty_fast_service_needed()
+{
+  // Include queued-but-not-yet-started lead/ETX cells as well as an active
+  // cell so the USB loop changes to the 1-ms cadence before the first edge.
+  return usb_rtty_active || (usb_rtty_head != usb_rtty_tail);
+}
+
+static void usb_rtty_process()
+{
+  if (!usb_control_line_ready()) return;
+
+  if (usb_rtty_tail == usb_rtty_head) return;
+  uint32_t now = micros();
+  const bool had_active_cell = usb_rtty_active;
+  const uint32_t scheduled_boundary_us = usb_rtty_due_us;
+  if (had_active_cell && !usb_time_reached(now, scheduled_boundary_us)) return;
+
+  const uint8_t tail = usb_rtty_tail;
+  const UsbRttyEvent ev = {
+    usb_rtty_queue[tail].kind,
+    usb_rtty_queue[tail].cwport,
+    usb_rtty_queue[tail].mark,
+    usb_rtty_queue[tail].duration_us
+  };
+  usb_rtty_tail = static_cast<uint8_t>((tail + 1) % USB_RTTY_QUEUE_LEN);
+
+  if (ev.kind == 1) {
+    usb_rtty_active = false;
+    usb_rtty_tx_done = true;
+    return;
+  }
+
+  const uint8_t old_state = usb_control_line_state();
+  uint8_t new_state = old_state;
+  const uint8_t mask = (ev.cwport == 3) ? 0x01 : 0x02;
+  // ev.mark is always the logical Baudot state used by diagnostics.  Apply
+  // optional inversion only at the final CDC DTR/RTS mapping so Baudot
+  // generation, timing logs, and the physical-line polarity stay separable.
+  const bool line_asserted = (ev.mark != 0) ^ usb_rtty_active_invert;
+  if (line_asserted) new_state |= mask;
+  else               new_state &= static_cast<uint8_t>(~mask);
+
+  uint8_t rcode = 0;
+  if (new_state != old_state)
+    rcode = usb_control_line_apply(new_state);
+
+  // Timestamp after the control transfer: this is closest to the instant
+  // at which the rig has accepted the new DTR/RTS state.
+  now = micros();
+  usb_rtty_record_boundary(now, ev.mark, rcode);
+  usb_rtty_last_duration_us = ev.duration_us;
+
+  // Keep a phase-locked 45.45-baud timeline instead of adding the USB-loop
+  // wake-up latency to every cell.  With 1-ms polling this gives adjacent
+  // cells a small +/- jitter while preserving the long-term 22.000-ms rate.
+  // If the task was delayed badly, resynchronise rather than emitting a very
+  // short catch-up cell.
+  if (had_active_cell) {
+    const int32_t late_us = (int32_t)(now - scheduled_boundary_us);
+    if (late_us >= 0 && late_us <= 4000)
+      usb_rtty_due_us = scheduled_boundary_us + ev.duration_us;
+    else
+      usb_rtty_due_us = now + ev.duration_us;
+  } else {
+    usb_rtty_due_us = now + ev.duration_us;
+  }
+  usb_rtty_active = true;
+}
+
+void USBRTTYtimingStatus(Print *out)
+{
+  if (!out) out = console;
+  const uint8_t qdepth = (usb_rtty_head >= usb_rtty_tail)
+      ? (usb_rtty_head - usb_rtty_tail)
+      : (USB_RTTY_QUEUE_LEN - usb_rtty_tail + usb_rtty_head);
+
+  uint32_t total_all = 0;
+  uint32_t min_all = 0xffffffffUL;
+  uint32_t max_all = 0;
+  uint32_t maxerr_all = 0;
+  uint32_t total_22 = 0, min_22 = 0xffffffffUL, max_22 = 0, late24_22 = 0, late30_22 = 0;
+  uint32_t total_11 = 0, min_11 = 0xffffffffUL, max_11 = 0;
+  uint16_t n22 = 0, n11 = 0;
+
+  const uint8_t n = usb_rtty_timing_n;
+  uint8_t idx = static_cast<uint8_t>((usb_rtty_timing_w + USB_RTTY_TIMING_LEN - n) % USB_RTTY_TIMING_LEN);
+  for (uint8_t i = 0; i < n; ++i) {
+    const UsbRttyTimingSample &sm = usb_rtty_timing[idx];
+    const uint32_t err = (sm.dt_us > sm.expected_us)
+        ? (sm.dt_us - sm.expected_us) : (sm.expected_us - sm.dt_us);
+    total_all += sm.dt_us;
+    if (sm.dt_us < min_all) min_all = sm.dt_us;
+    if (sm.dt_us > max_all) max_all = sm.dt_us;
+    if (err > maxerr_all) maxerr_all = err;
+
+    if (sm.expected_us == 22000UL) {
+      ++n22; total_22 += sm.dt_us;
+      if (sm.dt_us < min_22) min_22 = sm.dt_us;
+      if (sm.dt_us > max_22) max_22 = sm.dt_us;
+      if (sm.dt_us > 24000UL) ++late24_22;
+      if (sm.dt_us > 30000UL) ++late30_22;
+    } else if (sm.expected_us == 11000UL) {
+      ++n11; total_11 += sm.dt_us;
+      if (sm.dt_us < min_11) min_11 = sm.dt_us;
+      if (sm.dt_us > max_11) max_11 = sm.dt_us;
+    }
+    idx = static_cast<uint8_t>((idx + 1) % USB_RTTY_TIMING_LEN);
+  }
+
+  out->printf("USB RTTY active=%d fast=%d invert=%d q=%u drops=%lu samples=%u",
+              usb_rtty_active ? 1 : 0, usb_rtty_fast_service_needed() ? 1 : 0,
+              usb_rtty_invert ? 1 : 0, qdepth, (unsigned long)usb_rtty_drops, n);
+  if (n) {
+    out->printf(" all[min=%lu max=%lu avg=%lu maxerr=%lu]",
+                (unsigned long)min_all, (unsigned long)max_all,
+                (unsigned long)(total_all / n), (unsigned long)maxerr_all);
+  }
+  out->println();
+
+  if (n22) {
+    out->printf("  22ms n=%u min=%lu max=%lu avg=%lu >24ms=%lu >30ms=%lu\n",
+                n22, (unsigned long)min_22, (unsigned long)max_22,
+                (unsigned long)(total_22 / n22),
+                (unsigned long)late24_22, (unsigned long)late30_22);
+  }
+  if (n11) {
+    out->printf("  11ms n=%u min=%lu max=%lu avg=%lu\n",
+                n11, (unsigned long)min_11, (unsigned long)max_11,
+                (unsigned long)(total_11 / n11));
+  }
+}
+
+void USBRTTYtimingDump(Print *out)
+{
+  if (!out) out = console;
+  USBRTTYtimingStatus(out);
+  const uint8_t n = usb_rtty_timing_n;
+  uint8_t idx = static_cast<uint8_t>((usb_rtty_timing_w + USB_RTTY_TIMING_LEN - n) % USB_RTTY_TIMING_LEN);
+  for (uint8_t i = 0; i < n; ++i) {
+    const UsbRttyTimingSample &sm = usb_rtty_timing[idx];
+    out->printf("RTTY TIMING %u dt=%lu expected=%lu err=%ld state=%c rcode=0x%02X\n",
+                i, (unsigned long)sm.dt_us, (unsigned long)sm.expected_us,
+                (long)sm.dt_us - (long)sm.expected_us, sm.mark ? 'M' : 'S', sm.rcode);
+    idx = static_cast<uint8_t>((idx + 1) % USB_RTTY_TIMING_LEN);
+  }
+}
+
+static void usb_keying_queue_clear()
+{
+  usb_keying_tail = usb_keying_head;
+}
+
+void usb_keying_request(uint8_t cwport, bool on)
+{
+  if (cwport != 3 && cwport != 4) return;
+
+  const uint8_t head = usb_keying_head;
+  const uint8_t next = static_cast<uint8_t>((head + 1) % USB_KEYING_QUEUE_LEN);
+  if (next == usb_keying_tail) {
+    ++usb_keying_drops;
+    return;
+  }
+
+  usb_keying_queue[head].cwport = cwport;
+  usb_keying_queue[head].on = on ? 1 : 0;
+  usb_keying_head = next;
+}
 
 uint8_t ACMAsyncOper::OnInit(ACM *pacm) {
   uint8_t rcode;
   const bool is_qmx = pacm->IsDevice(QMX_USB_VID, QMX_USB_PID);
-  const bool is_ats_mini = pacm->IsDevice(0x303A, 0x1001);
+  const bool is_ats_mini = pacm->IsDevice(ATS_MINI_USB_VID, ATS_MINI_USB_PID);
   const usb_cat_profile_t &profile = usb_cat_profile(
     is_qmx ? USB_CAT_BACKEND_ACM_QMX : USB_CAT_BACKEND_ACM_GENERIC);
 
@@ -486,9 +1086,35 @@ uint8_t ACMAsyncOper::OnInit(ACM *pacm) {
    * be sent to it after enumeration.
    */
   if (is_qmx) {
-    const UBaseType_t cleared = usb_cat_reset_tx_queue();
-    usb_cat_set_backend(profile.backend);
-    console->println("USB ACM connected: QMX CAT");
+    UBaseType_t cleared = 0;
+    if (xQueueCATUSBTx != NULL) {
+      cleared = uxQueueMessagesWaiting(xQueueCATUSBTx);
+      xQueueReset(xQueueCATUSBTx);
+    }
+
+    /*
+     * Keep the Aug-4 QMX CAT path unchanged, but explicitly start the
+     * virtual modem-control outputs inactive.  QMX firmware may use DTR
+     * as the CW key; if the host/device retained DTR asserted, the rig
+     * remains keyed continuously even though CAT data itself works.
+     *
+     * Do not use SetLineCoding() here.  Also do not fail/release the ACM
+     * device if SET_CONTROL_LINE_STATE is rejected: CAT is the priority.
+     */
+    usb_acm_key_iface = pacm->GetControlIface();
+    /*
+     * QMX: DTR=1 keys TX, so the safe idle state on connect/reconnect is
+     * DTR=0, RTS=0.  Keep the Aug-4 CAT data path unchanged.
+     */
+    const uint8_t qmx_idle_state = 0x00; // DTR=0, RTS=0
+    const uint8_t qmx_ctl_rcode =
+      pacm->SetControlLineStateOnInterface(usb_acm_key_iface, qmx_idle_state);
+    usb_acm_line_state = qmx_idle_state;
+    usb_keying_queue_clear();
+
+    console->printf(
+      "USB ACM connected: QMX CAT control_if=%u idle DTR=0 RTS=0 rcode=0x%02X\n",
+      usb_acm_key_iface, qmx_ctl_rcode);
     if (verbose & VERBOSE_USB) {
       console->printf(
         "USB ACM detail: VID=%04X PID=%04X CDC control skipped queue cleared=%u\n",
@@ -511,12 +1137,22 @@ uint8_t ACMAsyncOper::OnInit(ACM *pacm) {
     return 0;
   }
 
-  // Preserve the existing ACM initialization for ICOM and other rigs.
-  rcode = pacm->SetControlLineState(2); // RTS only
+  // Use the first CDC ACM pair as the default keying port.  On IC-705
+  // this is USB(A): control IF 0 / data IF 1.
+  usb_acm_key_iface = pacm->GetControlIface();
+  console->printf("USB ACM interfaces: control=%u data=%u key_if=%u\n",
+                  pacm->GetControlIface(), pacm->GetDataIface(),
+                  usb_acm_key_iface);
+
+  // Start ICOM/generic ACM with both DTR and RTS inactive.  This is
+  // important when either line is assigned to CW/RTTY keying in the rig.
+  rcode = pacm->SetControlLineStateOnInterface(usb_acm_key_iface, 0);
   if (rcode) {
     ErrorMessage<uint8_t>(PSTR("SetControlLineState"), rcode);
     return rcode;
   }
+  usb_acm_line_state = 0;
+  usb_keying_queue_clear();
 
   LINE_CODING lc;
   lc.dwDTERate = 115200;
@@ -540,6 +1176,305 @@ ACMAsyncOper AsyncOper;
 ACM Acm(&Usb, &AsyncOper);
 CP2105 Cp2105(&Usb);
 static uint8_t cp2105_cat_port = 0;
+// Yaesu dual-port CP2105: Enhanced COM (port 0) is CAT, Standard COM
+// (port 1) carries PTT/CW/FSK control.  Keep its modem-line state separate
+// from the CDC ACM state used by Icom.
+static uint8_t cp2105_key_line_state = 0;
+static constexpr uint8_t CP2105_YAESU_KEY_PORT = 1;
+
+static bool yaesu_cp2105_keying_ready()
+{
+  if (!Cp2105.isReady() || Cp2105.isSinglePort() ||
+      !Cp2105.portReady(CP2105_YAESU_KEY_PORT)) return false;
+  for (int i = 0; i < N_RADIO; ++i) {
+    if (!radio_list[i].enabled || radio_list[i].rig_spec == NULL) continue;
+    struct rig *r = radio_list[i].rig_spec;
+    if (r->civport_num != -1) continue;
+    if (r->cat_type == CAT_TYPE_YAESU_NEW ||
+        r->cat_type == CAT_TYPE_YAESU_OLD ||
+        r->cat_type == CAT_TYPE_YAESU_FT817) return true;
+  }
+  return false;
+}
+
+static bool usb_control_line_ready()
+{
+  if (yaesu_cp2105_keying_ready()) return true;
+
+  // QMX uses standard CDC SET_CONTROL_LINE_STATE DTR for straight-key CW
+  // on recent firmware.  It is intentionally allowed here; QMX OnInit()
+  // merely avoids asserting the line during enumeration.
+  return Acm.isReady() &&
+         !Acm.IsDevice(ATS_MINI_USB_VID, ATS_MINI_USB_PID);
+}
+
+static uint8_t usb_control_line_state()
+{
+  return yaesu_cp2105_keying_ready() ? cp2105_key_line_state
+                                     : usb_acm_line_state;
+}
+
+bool CP2105controlTest(uint8_t port, char line, bool on, Stream *out)
+{
+  if (!out) out = console;
+
+  if (!Cp2105.isReady()) {
+    out->println("CP2105 not ready");
+    return false;
+  }
+  if (port >= CP2105::PORTS || !Cp2105.portReady(port)) {
+    out->printf("CP2105 port%u not ready\n", port);
+    return false;
+  }
+
+  uint8_t rcode = 0xff;
+  if (line == 'D' || line == 'd') {
+    rcode = Cp2105.SetDTR(port, on);
+    out->printf("CP2105 direct port=%u if=%u DTR=%u rcode=0x%02X\n",
+                port, Cp2105.interfaceNumber(port), on ? 1 : 0, rcode);
+  } else if (line == 'R' || line == 'r') {
+    rcode = Cp2105.SetRTS(port, on);
+    out->printf("CP2105 direct port=%u if=%u RTS=%u rcode=0x%02X\n",
+                port, Cp2105.interfaceNumber(port), on ? 1 : 0, rcode);
+  } else {
+    out->println("CP2105 direct: line must be D or R");
+    return false;
+  }
+
+  return rcode == 0;
+}
+
+static uint32_t cp2105_le32(const uint8_t *p)
+{
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void cp2105_put_le32(uint8_t *p, uint32_t v)
+{
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+  p[2] = (uint8_t)(v >> 16);
+  p[3] = (uint8_t)(v >> 24);
+}
+
+static void cp2105_print_flow(uint8_t port, const uint8_t flow[16], Stream *out)
+{
+  const uint32_t hs = cp2105_le32(flow + 0);
+  const uint32_t repl = cp2105_le32(flow + 4);
+  const uint32_t xon = cp2105_le32(flow + 8);
+  const uint32_t xoff = cp2105_le32(flow + 12);
+  out->printf("CP2105 flow port=%u if=%u raw=",
+              port, Cp2105.interfaceNumber(port));
+  for (int i = 0; i < 16; ++i) out->printf("%02X", flow[i]);
+  out->println();
+  out->printf(" handshake=0x%08lX replace=0x%08lX xon=%lu xoff=%lu\n",
+              (unsigned long)hs, (unsigned long)repl,
+              (unsigned long)xon, (unsigned long)xoff);
+  out->printf(" DTRmode=%lu RTSmode=%lu CTS_HS=%u DSR_HS=%u DCD_HS=%u DSRsens=%u\n",
+              (unsigned long)(hs & 0x03),
+              (unsigned long)((repl >> 6) & 0x03),
+              (hs & 0x08) ? 1 : 0, (hs & 0x10) ? 1 : 0,
+              (hs & 0x20) ? 1 : 0, (hs & 0x40) ? 1 : 0);
+}
+
+bool CP2105flowStatus(uint8_t port, Stream *out)
+{
+  if (!out) out = console;
+  if (!Cp2105.isReady() || port >= CP2105::PORTS || !Cp2105.portReady(port)) {
+    out->printf("CP2105 port%u not ready\n", port);
+    return false;
+  }
+  uint8_t flow[16] = {0};
+  const uint8_t rcode = Cp2105.GetFlow(port, flow);
+  if (rcode != 0) {
+    out->printf("CP2105 GET_FLOW port=%u rcode=0x%02X\n", port, rcode);
+    return false;
+  }
+  cp2105_print_flow(port, flow, out);
+  return true;
+}
+
+bool CP2105setManualFlow(uint8_t port, Stream *out)
+{
+  if (!out) out = console;
+  if (!Cp2105.isReady() || port >= CP2105::PORTS || !Cp2105.portReady(port)) {
+    out->printf("CP2105 port%u not ready\n", port);
+    return false;
+  }
+
+  uint8_t flow[16] = {0};
+  uint8_t rcode = Cp2105.GetFlow(port, flow);
+  if (rcode != 0) {
+    out->printf("CP2105 GET_FLOW port=%u rcode=0x%02X\n", port, rcode);
+    return false;
+  }
+
+  out->println("CP2105 flow before:");
+  cp2105_print_flow(port, flow, out);
+
+  uint32_t hs = cp2105_le32(flow + 0);
+  uint32_t repl = cp2105_le32(flow + 4);
+
+  // Match Linux cp210x with CRTSCTS disabled: software-controlled DTR/RTS,
+  // and no CTS/DSR/DCD hardware handshake or DSR sensitivity.
+  hs = (hs & ~0x0000007BUL) | 0x00000001UL;  // DTR ACTIVE/manual
+  repl = (repl & ~0x000000C0UL) | 0x00000040UL; // RTS ACTIVE/manual
+  cp2105_put_le32(flow + 0, hs);
+  cp2105_put_le32(flow + 4, repl);
+
+  rcode = Cp2105.SetFlow(port, flow);
+  if (rcode != 0) {
+    out->printf("CP2105 SET_FLOW port=%u rcode=0x%02X\n", port, rcode);
+    return false;
+  }
+
+  uint8_t verify[16] = {0};
+  rcode = Cp2105.GetFlow(port, verify);
+  if (rcode != 0) {
+    out->printf("CP2105 GET_FLOW verify port=%u rcode=0x%02X\n", port, rcode);
+    return false;
+  }
+  out->println("CP2105 flow after:");
+  cp2105_print_flow(port, verify, out);
+
+  uint8_t r1 = Cp2105.SetDTR(port, false);
+  uint8_t r2 = Cp2105.SetRTS(port, false);
+  out->printf("CP2105 manual line reset DTR_rcode=0x%02X RTS_rcode=0x%02X\n", r1, r2);
+  if (port == CP2105_YAESU_KEY_PORT && r1 == 0 && r2 == 0)
+    cp2105_key_line_state = 0;
+  return r1 == 0 && r2 == 0;
+}
+
+static uint8_t usb_control_line_apply(uint8_t new_state)
+{
+  new_state &= 0x03;
+  if (yaesu_cp2105_keying_ready()) {
+    /*
+     * Match Windows VCP SETDTR/CLRDTR and SETRTS/CLRRTS semantics:
+     * only the modem-control output that changed gets a SET_MHS write mask.
+     * On Yaesu Standard COM the other output may be PTT or CW/FSK keying.
+     */
+    const uint8_t changed = (cp2105_key_line_state ^ new_state) & 0x03;
+    uint8_t rcode = 0;
+
+    if (changed & 0x01) {
+      rcode = Cp2105.SetDTR(CP2105_YAESU_KEY_PORT,
+                            (new_state & 0x01) != 0);
+      if (rcode != 0) return rcode;
+      cp2105_key_line_state =
+        (cp2105_key_line_state & static_cast<uint8_t>(~0x01)) |
+        (new_state & 0x01);
+    }
+
+    if (changed & 0x02) {
+      rcode = Cp2105.SetRTS(CP2105_YAESU_KEY_PORT,
+                            (new_state & 0x02) != 0);
+      if (rcode != 0) return rcode;
+      cp2105_key_line_state =
+        (cp2105_key_line_state & static_cast<uint8_t>(~0x02)) |
+        (new_state & 0x02);
+    }
+
+    return 0;
+  }
+  if (!Acm.isReady()) return 0xff;
+  const uint8_t rcode =
+    Acm.SetControlLineStateOnInterface(usb_acm_key_iface, new_state);
+  if (rcode == 0) usb_acm_line_state = new_state;
+  return rcode;
+}
+
+void USBACMstatus(Print *out)
+{
+  if (!out) out = console;
+  out->printf("USB ACM ready=%d addr=%u VID=%04X PID=%04X\n",
+              Acm.isReady() ? 1 : 0, Acm.GetAddress(),
+              Acm.GetVid(), Acm.GetPid());
+  out->printf(" stored control_if=%u data_if=%u key_if=%u line_state=0x%02X\n",
+              Acm.GetControlIface(), Acm.GetDataIface(),
+              usb_acm_key_iface, usb_acm_line_state);
+  if (yaesu_cp2105_keying_ready())
+    out->printf(" Yaesu CP2105 key port=%u line_state=0x%02X (DTR/RTS)\n",
+                CP2105_YAESU_KEY_PORT, cp2105_key_line_state);
+  out->printf(" EP data IN=%u OUT=%u second IN=%u second=%d\n",
+              Acm.GetDataInEp(), Acm.GetDataOutEp(),
+              Acm.GetSecondDataInEp(), Acm.HasSecondDataIn() ? 1 : 0);
+  out->println(" line state: bit0=DTR bit1=RTS");
+}
+
+bool USBACMselectKeyInterface(uint8_t iface, Print *out)
+{
+  if (!out) out = console;
+  if (iface > 15) {
+    out->println("USB ACM interface must be 0..15");
+    return false;
+  }
+  usb_acm_key_iface = iface;
+  out->printf("USB ACM key/control interface=%u\n", usb_acm_key_iface);
+  return true;
+}
+
+bool USBACMcontrolTest(uint8_t state, Print *out)
+{
+  if (!out) out = console;
+  state &= 0x03;
+  if (!Acm.isReady()) {
+    out->println("USB ACM not ready");
+    return false;
+  }
+  const uint8_t rcode =
+      Acm.SetControlLineStateOnInterface(usb_acm_key_iface, state);
+  out->printf("USB ACM SET_CONTROL_LINE_STATE if=%u state=0x%02X "
+              "DTR=%u RTS=%u rcode=0x%02X\n",
+              usb_acm_key_iface, state,
+              (state & 0x01) ? 1 : 0, (state & 0x02) ? 1 : 0, rcode);
+  if (rcode == 0) {
+    usb_acm_line_state = state;
+    usb_keying_queue_clear();
+    return true;
+  }
+  return false;
+}
+
+void usb_keying_process()
+{
+  if (usb_keying_tail == usb_keying_head) return;
+
+  // Icom/generic radios use CDC ACM.  Yaesu dual-port CP2105 radios use
+  // Standard COM (port 1) for DTR/RTS TX control while CAT stays on port 0.
+  if (!usb_control_line_ready()) {
+    usb_keying_queue_clear();
+    return;
+  }
+
+  const uint8_t tail = usb_keying_tail;
+  const UsbKeyingEvent ev = {
+    usb_keying_queue[tail].cwport, usb_keying_queue[tail].on
+  };
+  usb_keying_tail = static_cast<uint8_t>((tail + 1) % USB_KEYING_QUEUE_LEN);
+
+  const uint8_t old_state = usb_control_line_state();
+  uint8_t new_state = old_state;
+  const uint8_t mask = (ev.cwport == 3) ? 0x01 : 0x02;
+  if (ev.on) new_state |= mask;
+  else       new_state &= static_cast<uint8_t>(~mask);
+
+  if (new_state == old_state) return;
+
+  const uint8_t rcode = usb_control_line_apply(new_state);
+  if (rcode == 0) {
+    if (verbose & VERBOSE_USB) {
+      console->printf("USB KEY if=%u %s=%u state=0x%02X drops=%lu\n",
+                      usb_acm_key_iface,
+                      ev.cwport == 3 ? "DTR" : "RTS", ev.on,
+                      usb_acm_line_state,
+                      (unsigned long)usb_keying_drops);
+    }
+  } else if (verbose & VERBOSE_USB) {
+    console->printf("USB KEY control error rcode=0x%02X\n", rcode);
+  }
+}
 
 bool usb_qmx_cat_ready() {
   return usb_cat_ready_for_rig_type(CAT_TYPE_QMX);
@@ -609,9 +1544,10 @@ bool CP2105setBaud(uint8_t port, uint32_t baudrate) {
 
 void CP2105status(Stream *out) {
   if (!out) out = console;
-  out->printf("CP2105 ready=%d addr=0x%02x CATport=%u\n",
+  out->printf("CP210x ready=%d addr=0x%02x VID=%04X PID=%04X single=%d CATport=%u\n",
                   Cp2105.isReady() ? 1 : 0,
-                  Cp2105.GetAddress(), cp2105_cat_port);
+                  Cp2105.GetAddress(), Cp2105.GetVid(), Cp2105.GetPid(),
+                  Cp2105.isSinglePort() ? 1 : 0, cp2105_cat_port);
   for (uint8_t port = 0; port < CP2105::PORTS; port++) {
     out->printf(" port%u ready=%d if=%u IN=%u/%u OUT=%u/%u baud=%lu%s\n",
                     port, Cp2105.portReady(port) ? 1 : 0,
@@ -623,8 +1559,52 @@ void CP2105status(Stream *out) {
   }
 }
 
+static bool cp210x_active_usb_rig(uint8_t *cat_type, uint32_t *baud)
+{
+  for (int i = 0; i < N_RADIO; ++i) {
+    if (!radio_list[i].enabled || radio_list[i].rig_spec == NULL) continue;
+    struct rig *r = radio_list[i].rig_spec;
+    if (r->civport_num != -1) continue;
+    if (r->cat_type == CAT_TYPE_YAESU_NEW ||
+        r->cat_type == CAT_TYPE_YAESU_OLD ||
+        r->cat_type == CAT_TYPE_YAESU_FT817 ||
+        r->cat_type == CAT_TYPE_KENWOOD) {
+      if (cat_type) *cat_type = r->cat_type;
+      if (baud) *baud = r->civport_baud;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool cp210x_prepare_selected_rig()
+{
+  uint8_t cat_type = 0;
+  uint32_t baud = 0;
+  if (!Cp2105.isReady() || !cp210x_active_usb_rig(&cat_type, &baud)) return false;
+
+  // CP2105: Yaesu CAT is the Enhanced COM port (port 0).
+  // CP2102: TS-590G has one UART, also represented as port 0.
+  cp2105_cat_port = 0;
+  if (Cp2105.isSinglePort()) {
+    if (cat_type != CAT_TYPE_KENWOOD) return false;
+  } else {
+    if (cat_type != CAT_TYPE_YAESU_NEW &&
+        cat_type != CAT_TYPE_YAESU_OLD &&
+        cat_type != CAT_TYPE_YAESU_FT817) return false;
+  }
+
+  if (baud != 0 && Cp2105.baudRate(cp2105_cat_port) != baud) {
+    uint8_t rcode = Cp2105.ConfigurePort(cp2105_cat_port, baud);
+    console->printf("CP210x USB CAT configure port=%u baud=%lu rcode=0x%02X\n",
+                    cp2105_cat_port, (unsigned long)baud, rcode);
+    if (rcode) return false;
+  }
+  return Cp2105.portReady(cp2105_cat_port);
+}
+
 void CP2105process() {
-  if (!Cp2105.isReady() || !Cp2105.portReady(cp2105_cat_port)) return;
+  if (!cp210x_prepare_selected_rig()) return;
   usb_cat_set_backend(USB_CAT_BACKEND_CP2105);
 
   struct catmsg_t catmsg;
@@ -806,7 +1786,7 @@ void ACMprocess() {
       (unsigned int)usb_cat_tx_free());
   }
 
-  if (Cp2105.isReady()) {
+  if (Cp2105.isReady() && cp210x_prepare_selected_rig()) {
     if ((verbose & VERBOSE_USB) && (qmx_attached || tx_waiting != 0)) {
       static uint32_t last_cp2105_redirect_report = 0;
       if (now - last_cp2105_redirect_report >= 1000) {
@@ -843,22 +1823,80 @@ void ACMprocess() {
       Acm.GetDataOutEp(), Acm.GetDataInEp(), Acm.GetSecondDataInEp(),
       Acm.HasSecondDataIn() ? 1 : 0);
 
-    // Queries generated before USB enumeration are deliberately suppressed.
-    // Seed the newly ready connection with a clean first status request.
-    usb_cat_set_backend(USB_CAT_BACKEND_ACM_QMX);
-    usb_cat_reset_tx_queue();
-    const usb_cat_profile_t &profile = usb_cat_profile(USB_CAT_BACKEND_ACM_QMX);
-    const bool queued = profile.startup_query &&
-      usb_cat_enqueue(reinterpret_cast<const uint8_t *>(profile.startup_query),
-                      strlen(profile.startup_query), false);
-    if (verbose & VERBOSE_USB) console->printf(
-      "QMX CAT startup enqueue ret=%d waiting=%u free=%u cmd=%s\n",
-      queued ? 1 : 0,
-      (unsigned int)usb_cat_tx_waiting(),
-      (unsigned int)usb_cat_tx_free(),
-      profile.startup_query ? profile.startup_query : "-");
+    // Fresh QMX ACM session forced IF query temporarily disabled.
+    // Let the normal periodic CAT query sequence start communication.
+#if 0
+    if (xQueueCATUSBTx) {
+      xQueueReset(xQueueCATUSBTx);
+      struct catmsg_t startup = {};
+      memcpy(startup.buf, "IF;", 3);
+      startup.size = 3;
+      const BaseType_t qret = xQueueSend(xQueueCATUSBTx, &startup, 0);
+      if (verbose & VERBOSE_USB) console->printf(
+        "QMX CAT startup enqueue ret=%d waiting=%u free=%u cmd=IF;\n",
+        qret,
+        (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx),
+        (unsigned int)uxQueueSpacesAvailable(xQueueCATUSBTx));
+    }
+#endif
   }
   qmx_ready_prev = qmx_ready_now;
+
+  /*
+   * QMX CAT rollback path (Aug-4 behavior).
+   * Keep QMX away from the newer generic USB CAT backend/activation logic:
+   * direct TX queue -> Acm.SndData(), direct Acm.RcvData() -> RX queue.
+   */
+  if (qmx_ready_now) {
+    struct catmsg_t qmx_msg;
+
+    while (uxQueueMessagesWaiting(xQueueCATUSBTx)) {
+      if (xQueueReceive(xQueueCATUSBTx, &qmx_msg, 0) == pdTRUE) {
+        if (verbose & VERBOSE_USB) {
+          console->printf("QMX USB CAT TX len=%d ascii=\"", qmx_msg.size);
+          for (int i = 0; i < qmx_msg.size; ++i) {
+            const uint8_t c = qmx_msg.buf[i];
+            console->print((c >= 0x20 && c <= 0x7e) ? (char)c : '.');
+          }
+          console->println("\"");
+        }
+
+        rcode = Acm.SndData(qmx_msg.size, (uint8_t *)qmx_msg.buf);
+        if (rcode) {
+          ErrorMessage<uint8_t>(PSTR("SndData CATUSBTx"), rcode);
+          plogw->ostream->println("SndData CATUSBTx error");
+        }
+      }
+    }
+
+    uint8_t qmx_buf[64];
+    uint16_t qmx_rcvd = sizeof(qmx_buf);
+    rcode = Acm.RcvData(&qmx_rcvd, qmx_buf);
+
+    if (rcode && rcode != hrNAK &&
+        (rcode != hrJERR || (verbose & VERBOSE_USB)))
+      ErrorMessage<uint8_t>(PSTR("Ret"), rcode);
+
+    if (qmx_rcvd) {
+      struct catmsg_t qmx_rx = {};
+      qmx_rx.size = min((uint16_t)sizeof(qmx_rx.buf), qmx_rcvd);
+      memcpy(qmx_rx.buf, qmx_buf, qmx_rx.size);
+      const BaseType_t qret = xQueueSend(xQueueCATUSBRx, &qmx_rx, 0);
+
+      if (verbose & VERBOSE_USB) {
+        console->printf("QMX USB CAT RX len=%u qret=%d ascii=\"",
+                        (unsigned int)qmx_rx.size, (int)qret);
+        for (int i = 0; i < qmx_rx.size; ++i) {
+          const uint8_t c = qmx_rx.buf[i];
+          console->print((c >= 0x20 && c <= 0x7e) ? (char)c : '.');
+        }
+        console->println("\"");
+      }
+    }
+
+    // QMX has only one CDC data interface; never poll RcvData1().
+    return;
+  }
 
   if (Acm.isReady()) {
     ats_mini_start_monitor_if_needed();
@@ -872,23 +1910,52 @@ void ACMprocess() {
         usb_cat_dump("TX", catmsg.buf, catmsg.size);
 	rcode = Acm.SndData(catmsg.size, (uint8_t *)catmsg.buf);
         const bool is_ats_mini = Acm.IsDevice(0x303A, 0x1001);
-	if (verbose & VERBOSE_USB) {
+
+        if (is_qmx) {
+          console->printf("QMX CAT TX rcode=0x%02X len=%d data=",
+                          rcode, catmsg.size);
+          for (int i = 0; i < catmsg.size; ++i) {
+            const uint8_t c = static_cast<uint8_t>(catmsg.buf[i]);
+            if (c >= 0x20 && c <= 0x7E)
+              console->print((char)c);
+            else
+              console->printf("\\x%02X", c);
+          }
+          console->println();
+        } else if (verbose & VERBOSE_USB) {
 	  console->printf("%sUSB CAT TX complete rcode=0x%02X len=%d\n",
-	                  is_qmx ? "QMX " : (is_ats_mini ? "ATS-MINI " : ""),
+	                  is_ats_mini ? "ATS-MINI " : "",
                           rcode, catmsg.size);
 	}
-        if (is_ats_mini && rcode == hrNAK) {
-          // TinyUSB may NAK briefly after enumeration or while its CDC task is
-          // busy. Preserve command order and retry instead of silently losing
-          // F<Hz> or other ATS commands.
-          if (!usb_cat_requeue_front(&catmsg) && (verbose & VERBOSE_USB))
+
+        if ((is_qmx || is_ats_mini) && rcode == hrNAK) {
+          /*
+           * Both QMX and ATS-MINI can briefly NAK just after enumeration.
+           * Preserve command order instead of losing the first startup query.
+           */
+          const bool requeued = usb_cat_requeue_front(&catmsg);
+          if (is_qmx) {
+            console->printf("QMX CAT TX NAK requeue=%d waiting=%u\n",
+                            requeued ? 1 : 0,
+                            (unsigned int)usb_cat_tx_waiting());
+          } else if (!requeued && (verbose & VERBOSE_USB)) {
             console->println("ATS-MINI TX NAK: failed to requeue command");
+          }
           break;
         }
+
 	if (rcode) {
 	  ErrorMessage<uint8_t>(PSTR("SndData CATUSBTx"), rcode);
 	  plogw->ostream->println("SndData CATUSBTx error");
 	}
+
+        /*
+         * QMX is request/response oriented.  Do not drain the whole CAT TX
+         * queue before polling Bulk IN; send one command, then immediately
+         * give the receive path a chance to collect the reply.
+         */
+        if (is_qmx)
+          break;
     }
 	
 	
@@ -925,13 +1992,28 @@ void ACMprocess() {
     uint16_t rcvd = 64;
     int ret;
     rcode = Acm.RcvData(&rcvd, buf);
-    if (rcode && rcode != hrNAK)   ErrorMessage<uint8_t>(PSTR("Ret"), rcode);
+    if (rcode && rcode != hrNAK &&
+        (rcode != hrJERR || (verbose & VERBOSE_USB)))
+      ErrorMessage<uint8_t>(PSTR("Ret"), rcode);
 
     struct catmsg_t catmsg;
     if (rcvd) {  //more than zero bytes received
       const bool is_qmx = Acm.IsDevice(QMX_USB_VID, QMX_USB_PID);
       usb_cat_set_backend(is_qmx ? USB_CAT_BACKEND_ACM_QMX
                                  : USB_CAT_BACKEND_ACM_GENERIC);
+
+      if (is_qmx) {
+        console->printf("QMX CAT RX len=%u data=", (unsigned int)rcvd);
+        for (uint16_t i = 0; i < rcvd; ++i) {
+          const uint8_t c = buf[i];
+          if (c >= 0x20 && c <= 0x7E)
+            console->print((char)c);
+          else
+            console->printf("\\x%02X", c);
+        }
+        console->println();
+      }
+
       usb_cat_dump("RX", buf, rcvd);
       ret = usb_cat_deliver_rx(buf, rcvd) ? pdTRUE : pdFALSE;
       if (verbose & VERBOSE_USB) plogw->ostream->printf(
@@ -945,14 +2027,21 @@ void ACMprocess() {
     if (Acm.HasSecondDataIn()) {
       rcvd=64;
       rcode = Acm.RcvData1(&rcvd, buf);
-      if (rcode && rcode != hrNAK) ErrorMessage<uint8_t>(PSTR("Ret1"), rcode);
+      if (rcode && rcode != hrNAK &&
+          (rcode != hrJERR || (verbose & VERBOSE_USB)))
+        ErrorMessage<uint8_t>(PSTR("Ret1"), rcode);
 
       if (rcvd) {
-        plogw->ostream->print("ACMrcvd1:");
-        for (uint16_t i = 0; i < rcvd; i++) {
-          plogw->ostream->print((char)buf[i]);
+        // IC-705 second CDC data interface: feed both the decoder display and
+        // conservative callsign extraction path.
+        for (uint16_t i = 0; i < rcvd; ++i) rtty_decoder_feed_byte(buf[i]);
+        rtty_decoder_display_snapshot();
+
+        if (verbose & VERBOSE_USB) {
+          plogw->ostream->print("ACMrcvd1:");
+          for (uint16_t i = 0; i < rcvd; i++) plogw->ostream->print((char)buf[i]);
+          plogw->ostream->print("\r\n");
         }
-        plogw->ostream->print("\r\n");
       }
     }
   }
@@ -1576,6 +2665,19 @@ void KbdRptParser::PrintKey(uint8_t m, uint8_t key) {
 
 HIDBoot<USB_HID_PROTOCOL_KEYBOARD> HidKeyboard(&Usb);
 KbdRptParser Prs,Prs1;
+
+bool usb_audio_capture_active() { return PcmAudio.capturing(); }
+bool usb_audio_capture_start(Print *out) { return PcmAudio.start(out); }
+void usb_audio_capture_stop(Print *out) { PcmAudio.stop(out); }
+void usb_audio_capture_status(Print *out) { PcmAudio.status(out); }
+void usb_audio_capture_free(Print *out) { PcmAudio.freeBuffer(out); }
+void usb_audio_capture_diagnose(Print *out) { PcmAudio.diagnose(out); }
+void usb_audio_capture_set_sof_sync(bool enable, Print *out) { PcmAudio.setSofSync(enable, out); }
+bool usb_audio_capture_sof_sync() { return PcmAudio.sofSync(); }
+const int16_t *usb_audio_capture_buffer() { return PcmAudio.buffer(); }
+size_t usb_audio_capture_samples() { return PcmAudio.samples(); }
+uint32_t usb_audio_capture_sample_rate() { return PCMAudioCapture::kSampleRate; }
+
 void init_usb()
 {
     Prs1.init_extKbd();
@@ -1585,10 +2687,10 @@ void init_usb()
      * This emulates unplugging and reconnecting it.
      */
     Usb.vbusPower(vbus_off);
-    delay(1500);
+    delay(500);
 
     Usb.vbusPower(vbus_on);
-    delay(1000);
+    delay(500);
 
     int8_t ret = Usb.Init(1500);
 
@@ -1653,6 +2755,8 @@ void loop_usb()
     static uint32_t last_report = 0;
 
     Usb.Task();
+    usb_rtty_process();
+    usb_keying_process();
 
     uint8_t state = Usb.getUsbTaskState();
     uint8_t vbus = Usb.getVbusState();
@@ -1796,6 +2900,25 @@ void usb_receive_cat_data(struct radio *radio) {
   // every received chunk into the existing per-radio CAT ring buffer; the
   // normal CAT parser will join the chunks and recognize the ';' terminator.
   while (xQueueReceive(xQueueCATUSBRx, &catmsg, 0) == pdTRUE) {
+    if (verbose & VERBOSE_USB) {
+      static uint32_t bind_ascii_rx_seq = 0;
+      ++bind_ascii_rx_seq;
+      console->printf(
+        "[USBBIND] RX_CONSUME seq=%lu path=ASCII radio=%d spec=%d name=%s "
+        "cat_type=%d civport=%d size=%d data=",
+        (unsigned long)bind_ascii_rx_seq, radio->rig_idx, radio->rig_spec_idx,
+        radio->rig_spec->name ? radio->rig_spec->name : "(null)",
+        radio->rig_spec->cat_type, radio->rig_spec->civport_num, catmsg.size);
+      const int bind_dump_n = catmsg.size < 16 ? catmsg.size : 16;
+      for (int bi = 0; bi < bind_dump_n; ++bi) {
+        const uint8_t c = (uint8_t)catmsg.buf[bi];
+        if (c >= 0x20 && c <= 0x7e) console->print((char)c);
+        else console->printf("\\x%02X", c);
+      }
+      if (catmsg.size > bind_dump_n) console->print("...");
+      console->println();
+    }
+
     int size = catmsg.size;
     if (size < 0) size = 0;
     if (size > (int)sizeof(catmsg.buf)) size = sizeof(catmsg.buf);

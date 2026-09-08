@@ -65,8 +65,19 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         EpInfo *oldep_ptr = NULL;
         uint8_t num_of_conf; // number of configurations
         bool ats_mini_bulk_only = false;
+        const uint32_t enum_start_ms = millis();
+        uint8_t enum_retry_addr0 = 0;
+        uint8_t enum_retry_addrn = 0;
+        uint8_t saved_addr0_nak_power = 0;
+        uint8_t saved_addrn_nak_power = 0;
+        // Enumeration-only EP0 NAK limit.  Normal EP0 uses MAX_POWER (15),
+        // which can keep one control transfer blocked for ~5 s.  Power 4
+        // returns control to the explicit outer retry loop much sooner.
+        const uint8_t enum_ep0_nak_power = 4;
 
         AddressPool &addrPool = pUsb->GetAddressPool();
+
+        USB_HOST_SERIAL.println("USB ACM enum start");
 
         if (verbose & VERBOSE_USB) USBTRACE("ACM Init\r\n");
 
@@ -99,13 +110,49 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
          * request here.  Read 8 bytes first, learn bMaxPacketSize0, assign an
          * address, then fetch the complete descriptor at the new address.
          */
-        rcode = pUsb->getDevDescr(0, 0, 8, (uint8_t*)buf);
+        saved_addr0_nak_power = epInfo[0].bmNakPower;
+        epInfo[0].bmNakPower = enum_ep0_nak_power;
+
+        for(uint8_t retry = 0; retry < 20; retry++) {
+                rcode = pUsb->getDevDescr(0, 0, 8, (uint8_t*)buf);
+                if(rcode != hrNAK && rcode != hrJERR)
+                        break;
+
+                enum_retry_addr0++;
+                USB_HOST_SERIAL.print("ACM getDevDescr addr=0 len=8 retry ");
+                USB_HOST_SERIAL.print(retry + 1);
+                USB_HOST_SERIAL.print(" rcode=0x");
+                USB_HOST_SERIAL.println(rcode, HEX);
+                delay(100);
+        }
+
+        USB_HOST_SERIAL.print("USB ACM enum addr0 retries=");
+        USB_HOST_SERIAL.print(enum_retry_addr0);
+        USB_HOST_SERIAL.print(" elapsed=");
+        USB_HOST_SERIAL.print(millis() - enum_start_ms);
+        USB_HOST_SERIAL.println(" ms");
+
+        epInfo[0].bmNakPower = saved_addr0_nak_power;
 
         // Restore p->epinfo
         p->epinfo = oldep_ptr;
 
-        if(rcode)
+        if(rcode) {
+                USB_HOST_SERIAL.print("ACM getDevDescr addr=0 len=8 failed rcode=0x");
+                USB_HOST_SERIAL.println(rcode, HEX);
                 goto FailGetDevDescr;
+        }
+
+        /*
+         * A USB hub advertises bDeviceClass=0x09 in the first 8 bytes of the
+         * device descriptor.  Reject it here while it is still at address 0.
+         * Do not allocate/set/release an address in ACM; leave the device
+         * untouched for USBHub::Init() in the same enumeration pass.
+         */
+        if(udd->bDeviceClass == 0x09) {
+                USBTRACE("ACM skip USB hub at addr0\r\n");
+                return USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
+        }
 
         // Extract Max Packet Size from the first 8 descriptor bytes
         epInfo[0].maxPktSize = udd->bMaxPacketSize0;
@@ -139,9 +186,48 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         p->lowspeed = lowspeed;
 
         // Read the complete descriptor now that EP0 size/address are known.
-        rcode = pUsb->getDevDescr(bAddress, 0, constBufSize, (uint8_t*)buf);
-        if(rcode)
+        // A reconnecting QMX can need additional settling time after SET_ADDRESS.
+        // Until setEpInfoEntry() below, this address uses the shared default EP0
+        // record.  Shorten only this descriptor phase, then restore it.
+        saved_addrn_nak_power = p->epinfo[0].bmNakPower;
+        p->epinfo[0].bmNakPower = enum_ep0_nak_power;
+
+        for(uint8_t retry = 0; retry < 20; retry++) {
+                rcode = pUsb->getDevDescr(bAddress, 0, constBufSize, (uint8_t*)buf);
+                if(rcode != hrNAK && rcode != hrJERR)
+                        break;
+
+                USB_HOST_SERIAL.print("ACM getDevDescr addr=");
+                USB_HOST_SERIAL.print(bAddress);
+                USB_HOST_SERIAL.print(" len=");
+                USB_HOST_SERIAL.print(constBufSize);
+                enum_retry_addrn++;
+                USB_HOST_SERIAL.print(" retry ");
+                USB_HOST_SERIAL.print(retry + 1);
+                USB_HOST_SERIAL.print(" rcode=0x");
+                USB_HOST_SERIAL.println(rcode, HEX);
+                delay(100);
+        }
+
+        USB_HOST_SERIAL.print("USB ACM enum addr");
+        USB_HOST_SERIAL.print(bAddress);
+        USB_HOST_SERIAL.print(" retries=");
+        USB_HOST_SERIAL.print(enum_retry_addrn);
+        USB_HOST_SERIAL.print(" elapsed=");
+        USB_HOST_SERIAL.print(millis() - enum_start_ms);
+        USB_HOST_SERIAL.println(" ms");
+
+        p->epinfo[0].bmNakPower = saved_addrn_nak_power;
+
+        if(rcode) {
+                USB_HOST_SERIAL.print("ACM getDevDescr addr=");
+                USB_HOST_SERIAL.print(bAddress);
+                USB_HOST_SERIAL.print(" len=");
+                USB_HOST_SERIAL.print(constBufSize);
+                USB_HOST_SERIAL.print(" failed rcode=0x");
+                USB_HOST_SERIAL.println(rcode, HEX);
                 goto FailGetDevDescr;
+        }
 
         num_of_conf = udd->bNumConfigurations;
         idVendor = udd->idVendor;
@@ -217,9 +303,21 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
                  epInfo[epDataOutIndex].epAddr != 0);
 
         if(bNumEP < 4 && !ats_mini_bulk_only) {
-	  USBTRACE2("cdcacm init, usb dev conf error dev not suppored numep:", bNumEP);	  
+                USBTRACE2("cdcacm init, usb dev conf error dev not supported numep:", bNumEP);
+                /*
+                 * We already assigned a USB address while probing this device.
+                 * Returning DEVICE_NOT_SUPPORTED without undoing that leaves this
+                 * ACM instance consumed by a non-CDC device (for example the
+                 * IC-705 external USB audio codec 08BB:2901), so a later CDC
+                 * device can never use the instance.  Put the rejected device
+                 * back at address 0, release our pool entry/state, and let the
+                 * USB core try another class driver/default addressing.
+                 */
+                const uint8_t rejected_addr = bAddress;
+                pUsb->setAddr(rejected_addr, 0, 0);
+                Release();
                 return USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
-	}
+        }
 
         if(ats_mini_bulk_only) {
                 USBTRACE2("cdcacm init ATS-MINI bulk-only accepted numep:", bNumEP);
@@ -251,6 +349,20 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         if (verbose & VERBOSE_USB) USBTRACE("cdcacm init ACM configured\r\n");
 
         ready = true;
+
+        USB_HOST_SERIAL.print("USB ACM enum done addr=");
+        USB_HOST_SERIAL.print(bAddress);
+        USB_HOST_SERIAL.print(" VID=");
+        USB_HOST_SERIAL.print(idVendor, HEX);
+        USB_HOST_SERIAL.print(" PID=");
+        USB_HOST_SERIAL.print(idProduct, HEX);
+        USB_HOST_SERIAL.print(" retries=");
+        USB_HOST_SERIAL.print(enum_retry_addr0);
+        USB_HOST_SERIAL.print("/");
+        USB_HOST_SERIAL.print(enum_retry_addrn);
+        USB_HOST_SERIAL.print(" total=");
+        USB_HOST_SERIAL.print(millis() - enum_start_ms);
+        USB_HOST_SERIAL.println(" ms");
 
         //bPollEnable = true;
 
@@ -290,11 +402,22 @@ FailOnInit:
 Fail:
         NotifyFail(rcode);
 #endif
+        USB_HOST_SERIAL.print("USB ACM enum FAILED rcode=0x");
+        USB_HOST_SERIAL.print(rcode, HEX);
+        USB_HOST_SERIAL.print(" addr=");
+        USB_HOST_SERIAL.print(bAddress);
+        USB_HOST_SERIAL.print(" retries=");
+        USB_HOST_SERIAL.print(enum_retry_addr0);
+        USB_HOST_SERIAL.print("/");
+        USB_HOST_SERIAL.print(enum_retry_addrn);
+        USB_HOST_SERIAL.print(" total=");
+        USB_HOST_SERIAL.print(millis() - enum_start_ms);
+        USB_HOST_SERIAL.println(" ms");
         Release();
         return rcode;
 }
 
-void ACM::EndpointXtract(uint8_t conf, uint8_t iface __attribute__((unused)), uint8_t alt __attribute__((unused)), uint8_t proto __attribute__((unused)), const USB_ENDPOINT_DESCRIPTOR *pep) {
+void ACM::EndpointXtract(uint8_t conf, uint8_t iface, uint8_t alt __attribute__((unused)), uint8_t proto __attribute__((unused)), const USB_ENDPOINT_DESCRIPTOR *pep) {
         //ErrorMessage<uint8_t > (PSTR("Conf.Val"), conf);
         //ErrorMessage<uint8_t > (PSTR("Iface Num"), iface);
         //ErrorMessage<uint8_t > (PSTR("Alt.Set"), alt);
@@ -307,19 +430,23 @@ void ACM::EndpointXtract(uint8_t conf, uint8_t iface __attribute__((unused)), ui
 	if (verbose & VERBOSE_USB) USBTRACE2("EndPointExtract() bmAttributes:",pep->bmAttributes);
 	if (verbose & VERBOSE_USB) USBTRACE2("EndPointExtract() bmEndpointAddress:",pep->bEndpointAddress);
         if((pep->bmAttributes & bmUSB_TRANSFER_TYPE) == USB_TRANSFER_TYPE_INTERRUPT && (pep->bEndpointAddress & 0x80) == 0x80) {
-	  if ((pep->bEndpointAddress&0xf)<=3) {
-	    index = epInterruptInIndex;
-	  } else {
-	    index = epInterruptIn1Index;
-	  }
-	}
+          if ((pep->bEndpointAddress&0xf)<=3) {
+            index = epInterruptInIndex;
+            // First CDC ACM control interface.  IC-705 USB(A) is IF 0.
+            bControlIface = iface;
+          } else {
+            index = epInterruptIn1Index;
+          }
+        }
         else if((pep->bmAttributes & bmUSB_TRANSFER_TYPE) == USB_TRANSFER_TYPE_BULK) {
-	  if ((pep->bEndpointAddress&0xf)<=3) {
-	    index = ((pep->bEndpointAddress & 0x80) == 0x80) ? epDataInIndex : epDataOutIndex;
-	  } else {
-	    index = ((pep->bEndpointAddress & 0x80) == 0x80) ? epDataIn1Index : epDataOut1Index;
-	  }
-	}
+          if ((pep->bEndpointAddress&0xf)<=3) {
+            index = ((pep->bEndpointAddress & 0x80) == 0x80) ? epDataInIndex : epDataOutIndex;
+            // First CDC ACM data interface.  IC-705 USB(A) is IF 1.
+            bDataIface = iface;
+          } else {
+            index = ((pep->bEndpointAddress & 0x80) == 0x80) ? epDataIn1Index : epDataOut1Index;
+          }
+        }
         else {
 	  USBTRACE("EndPointExtract return");
                 return;
@@ -373,7 +500,54 @@ uint8_t ACM::Poll() {
 }
 
 uint8_t ACM::RcvData(uint16_t *bytes_rcvd, uint8_t *dataptr) {
-        uint8_t rv = pUsb->inTransfer(bAddress, epInfo[epDataInIndex].epAddr, bytes_rcvd, dataptr);
+        const bool qmx_phys_diag =
+                ((verbose & VERBOSE_USB) &&
+                 idVendor == 0x0483 && idProduct == 0xA34C);
+        const uint8_t ep = epInfo[epDataInIndex].epAddr;
+        const uint16_t requested = bytes_rcvd ? *bytes_rcvd : 0;
+
+        uint8_t rv = pUsb->inTransfer(bAddress, ep, bytes_rcvd, dataptr);
+
+        if(qmx_phys_diag && rv == 0 && bytes_rcvd && *bytes_rcvd) {
+                USB_HOST_SERIAL.print("[USBPHYS-RX] addr=");
+                USB_HOST_SERIAL.print(bAddress);
+                USB_HOST_SERIAL.print(" ep=0x");
+                USB_HOST_SERIAL.print(ep | 0x80, HEX);
+                USB_HOST_SERIAL.print(" requested=");
+                USB_HOST_SERIAL.print(requested);
+                USB_HOST_SERIAL.print(" len=");
+                USB_HOST_SERIAL.print(*bytes_rcvd);
+                USB_HOST_SERIAL.print(" rcode=0x");
+                USB_HOST_SERIAL.println(rv, HEX);
+
+                USB_HOST_SERIAL.print("[USBPHYS-RX] HEX ");
+                for(uint16_t i = 0; i < *bytes_rcvd; i++) {
+                        if(dataptr[i] < 0x10)
+                                USB_HOST_SERIAL.print('0');
+                        USB_HOST_SERIAL.print(dataptr[i], HEX);
+                        USB_HOST_SERIAL.print(' ');
+                }
+                USB_HOST_SERIAL.println();
+
+                USB_HOST_SERIAL.print("[USBPHYS-RX] ASCII \"");
+                for(uint16_t i = 0; i < *bytes_rcvd; i++) {
+                        const uint8_t c = dataptr[i];
+                        USB_HOST_SERIAL.print((c >= 0x20 && c <= 0x7e) ? (char)c : '.');
+                }
+                USB_HOST_SERIAL.println("\"");
+        } else if(qmx_phys_diag && rv && rv != hrNAK) {
+                USB_HOST_SERIAL.print("[USBPHYS-RX] addr=");
+                USB_HOST_SERIAL.print(bAddress);
+                USB_HOST_SERIAL.print(" ep=0x");
+                USB_HOST_SERIAL.print(ep | 0x80, HEX);
+                USB_HOST_SERIAL.print(" requested=");
+                USB_HOST_SERIAL.print(requested);
+                USB_HOST_SERIAL.print(" len=");
+                USB_HOST_SERIAL.print(bytes_rcvd ? *bytes_rcvd : 0);
+                USB_HOST_SERIAL.print(" rcode=0x");
+                USB_HOST_SERIAL.println(rv, HEX);
+        }
+
         if(rv && rv != hrNAK) {
                 Release();
         }
@@ -388,7 +562,60 @@ uint8_t ACM::RcvData1(uint16_t *bytes_rcvd, uint8_t *dataptr) {
 }
 
 uint8_t ACM::SndData(uint16_t nbytes, uint8_t *dataptr) {
-        uint8_t rv = pUsb->outTransfer(bAddress, epInfo[epDataOutIndex].epAddr, nbytes, dataptr);
+        const bool qmx_phys_diag =
+                ((verbose & VERBOSE_USB) &&
+                 idVendor == 0x0483 && idProduct == 0xA34C);
+        const uint8_t ep = epInfo[epDataOutIndex].epAddr;
+
+        if(qmx_phys_diag) {
+                USB_HOST_SERIAL.print("[USBPHYS-TX] PRE addr=");
+                USB_HOST_SERIAL.print(bAddress);
+                USB_HOST_SERIAL.print(" ep=0x");
+                USB_HOST_SERIAL.print(ep, HEX);
+                USB_HOST_SERIAL.print(" len=");
+                USB_HOST_SERIAL.println(nbytes);
+
+                USB_HOST_SERIAL.print("[USBPHYS-TX] HEX ");
+                for(uint16_t i = 0; i < nbytes; i++) {
+                        if(dataptr[i] < 0x10)
+                                USB_HOST_SERIAL.print('0');
+                        USB_HOST_SERIAL.print(dataptr[i], HEX);
+                        USB_HOST_SERIAL.print(' ');
+                }
+                USB_HOST_SERIAL.println();
+
+                USB_HOST_SERIAL.print("[USBPHYS-TX] ASCII \"");
+                for(uint16_t i = 0; i < nbytes; i++) {
+                        const uint8_t c = dataptr[i];
+                        USB_HOST_SERIAL.print((c >= 0x20 && c <= 0x7e) ? (char)c : '.');
+                }
+                USB_HOST_SERIAL.println("\"");
+        }
+
+        uint8_t rv = pUsb->outTransfer(bAddress, ep, nbytes, dataptr);
+
+        if(qmx_phys_diag) {
+                USB_HOST_SERIAL.print("[USBPHYS-TX] POST addr=");
+                USB_HOST_SERIAL.print(bAddress);
+                USB_HOST_SERIAL.print(" ep=0x");
+                USB_HOST_SERIAL.print(ep, HEX);
+                USB_HOST_SERIAL.print(" len=");
+                USB_HOST_SERIAL.print(nbytes);
+                USB_HOST_SERIAL.print(" rcode=0x");
+                USB_HOST_SERIAL.println(rv, HEX);
+        }
+
+
+        /*
+         * Timing experiment for QMX: the packet-dump diagnostics made
+         * reconnect/switching reliable.  Reproduce only a small part of
+         * that timing effect without changing CDC control state.
+         */
+        if(rv == 0 && idVendor == 0x0483 && idProduct == 0xA34C) {
+	  ::delay(1);
+	  
+        }
+
         if(rv && rv != hrNAK) {
                 Release();
         }
@@ -447,6 +674,16 @@ uint8_t ACM::SetControlLineState(uint8_t state) {
         if(rv && rv != hrNAK) {
                 Release();
         }
+        return rv;
+}
+
+uint8_t ACM::SetControlLineStateOnInterface(uint8_t iface, uint8_t state) {
+        uint8_t rv = ( pUsb->ctrlReq(bAddress, 0, bmREQ_CDCOUT,
+                CDC_SET_CONTROL_LINE_STATE, state, 0, iface,
+                0, 0, NULL, NULL));
+        // This routine is primarily a diagnostic probe.  Do not Release()
+        // the whole ACM device when a candidate interface STALLs; the caller
+        // may immediately try another interface number.
         return rv;
 }
 

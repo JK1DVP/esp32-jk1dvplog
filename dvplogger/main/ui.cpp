@@ -120,6 +120,7 @@ static const HelpPage help_pages[] = {
   {{"ESM/ALTCQ/2BSIQ", "OFF/ONCONTEST", "CONTEST", "KEY/STRAIGHT", "TOGGLEPTT", "CWJQF/CWNORMAL"}},
   {{"KBDJP/US", "PADDLENOR/REV", "IAMBICA/B", "MUX/NOMUXTRANS", "CALLHIST<file>", "CALLHISTMAIN/SUB"}},
   {{"WIFI", "SUBCPURESET", "VERBOSEnn/DEBUG", "LISTDIR/MEMSTAT/ADCSTAT", "HELP/HELPR", "SATELLITE"}},
+  {{"XITON", "XITOFF", "XITRESET", "UP/DN:+/-20Hz S&P", "Yaesu:TX-only CLAR", "SAVE stores offset"}},
 
   // Shortcut supplement only; no CALLSIGN commands on this page.
   {{"A-s:track mode", "\\:Focus Radio", "C-S-2:Prev Contest", "C-S-t/y:Multi prev/next", "C-S-c/r:Contest/RIG", "ESC:Cancel TX"}},
@@ -823,6 +824,9 @@ if (key == 0x1f) {
 	radio->cq[radio->modetype] = LOG_CQ;
       }
 
+      // XIT is effective only in S&P; CQ always forces zero offset.
+      apply_xit_for_operating_mode(radio);
+
       if (radio->cq[radio->modetype]== LOG_CQ) {
 	console->println("CQ");
       } else {
@@ -932,13 +936,9 @@ if (key == 0x1f) {
       upd_display_bandmap();
     }
     
-    if (key == 0x08) {  //Alt-E enable/disable usb keying  process (to concentrate in USB DTR keying in the main loop)
-      enable_usb_keying = 1 - enable_usb_keying;
-      if (!plogw->f_console_emu) {
-	plogw->ostream->print("usb keying=");
-	plogw->ostream->println(enable_usb_keying);
-      }
-      sprintf(dp->lcdbuf, "USB keying=%d\n", enable_usb_keying);
+    if (key == 0x08) {  // Alt-E: USB keying usage hint
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "USB keying via RIG CW:\n3=DTR 4=RTS");
       upd_display_info_flash(dp->lcdbuf);
     }
 
@@ -1043,8 +1043,12 @@ if (key == 0x1f) {
       upd_display_sat();
     }
     if (key == 0x1a) {
-      // Alt-w to wipe the qso
-      wipe_log_entry();
+      // Alt-W normally wipes the whole QSO.  WIPEKEYSWAP exchanges the
+      // Alt-W and Ctrl-W actions for operators who prefer the opposite pair.
+      if (plogw->wipe_key_swap)
+        clear_current_edit_field(radio);
+      else
+        wipe_log_entry();
       upd_display();
     }
     if (key == 0x37) {
@@ -1297,8 +1301,11 @@ if (key == 0x1f) {
           switch_logw_entry(2);
         }
 	break;
-      case 0x1a:  // Ctrl-W: clear only the currently edited field
-        clear_current_edit_field(radio);
+      case 0x1a:  // Ctrl-W: normally clear field; optionally swap with Alt-W
+        if (plogw->wipe_key_swap)
+          wipe_log_entry();
+        else
+          clear_current_edit_field(radio);
         upd_display();
         break;
       case 0x1d: // ctrl-z send Remarks to Z-server
@@ -1689,13 +1696,23 @@ if (key == 0x1f) {
 
       // frequency control keys
     case 0x51:  // DOWN
-      adjust_frequency(-100/FREQ_UNIT);
-      upd_display();            
+    case 0x52: { // UP
+      struct radio *xr = so2r.radio_selected();
+      if (xr != NULL && xr->xit_enabled && xit_control_supported(xr) &&
+          xr->cq[xr->modetype] == LOG_SandP) {
+        xr->xit_offset_hz += (key == 0x52) ? 20 : -20;
+        if (xr->xit_offset_hz > 9999) xr->xit_offset_hz = 9999;
+        if (xr->xit_offset_hz < -9999) xr->xit_offset_hz = -9999;
+        apply_xit_for_operating_mode(xr);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "XIT %+d Hz", xr->xit_offset_hz);
+        upd_display_info_flash(dp->lcdbuf);
+        info_disp.timer = 1000;
+      } else {
+        adjust_frequency((key == 0x52 ? +100 : -100) / FREQ_UNIT);
+        upd_display();
+      }
       break;
-    case 0x52:  // UP
-      adjust_frequency(+100/FREQ_UNIT);
-      upd_display();            
-      break;
+    }
 
     case 0x46:  // PRTSC
     case 0x49:  // INS
@@ -1794,6 +1811,7 @@ void function_keys(uint8_t key, uint8_t c) {
       if (radio->cq[radio->modetype] == LOG_SandP) {
         radio->cq[radio->modetype] = LOG_CQ;
       }
+      apply_xit_for_operating_mode(radio);
       // memorize current frequency to freqbank cq freqnency
       save_freq_mode_filt(radio);
       // abcdef012345
@@ -1848,14 +1866,8 @@ void function_keys(uint8_t key, uint8_t c) {
 	}
     } else if (radio->modetype== LOG_MODETYPE_DG) {  // RTTY
       set_rttymemory_string(radio, key - 0x3a + 1, plogw->rtty_msg[key - 0x3a] + 2);
-      // こちらもsequence_modeにしたがって制御する必要あり。      
-      // rtty message sent to cw buffer (or rig's memory )
-      // and send it on the air
-      if (!enable_usb_keying) {
-	delay(200);
-	send_rtty_memory(radio, key - 0x3a + 1);  // command sending the stored memory
-      }
-      //       send cat command to transmit memory
+      // set_rttymemory_string() queues the local Baudot/FSK generator for
+      // every rig.  rig_spec->cwport selects GPIO0/1/2, DTR, or RTS.
     }
   }
 }
@@ -2239,10 +2251,18 @@ void process_enter(int option) {
   case 26:  // wifi_passwd
     multiwifi_addap(plogw->wifi_ssid+2,plogw->wifi_passwd+2);    
     break;
-  case 27:  // rig_spec_str -> set spec to the rig
+  case 27: { // rig_spec_str -> set spec to the rig
     sprintf(dp->lcdbuf, "modifying rig_spec... ");
     upd_display_info_flash(dp->lcdbuf);
-    set_rig_spec_from_str(radio,radio->rig_spec_str+2);
+    char rig_update_err[96];
+    if (!update_rig_spec(radio->rig_spec_idx, radio->rig_spec_str + 2,
+                         rig_update_err, sizeof(rig_update_err))) {
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "%s", rig_update_err);
+      upd_display_info_flash(dp->lcdbuf);
+      // Restore the edit buffer from the unchanged rig_spec.
+      set_rig_spec_str_from_spec(radio);
+      break;
+    }
     if (verbose&4) {
     console->print("Now edit rig name is ");
     console->print(radio->rig_name+2);
@@ -2253,8 +2273,7 @@ void process_enter(int option) {
     console->print(" and rig_spec_str is ");
     console->println(radio->rig_spec_str+2);
     }
-	// select_rig assume rig_spec_idx does not change, but in this flow, name may be changed.... 25/9/21
-    select_rig(radio);
+    // update_rig_spec() has already re-selected every radio using this rig.
     if (verbose&4) {
     console->print("After select_rig(), Now edit rig name is ");
     console->print(radio->rig_name+2);
@@ -2268,6 +2287,7 @@ void process_enter(int option) {
     sprintf(dp->lcdbuf, "modifying rig_spec\nfinished.");
     upd_display_info_flash(dp->lcdbuf);
     break;
+  }
   case 28:  // zserver_name -> connect to zserver
     reconnect_zserver();
     break;
@@ -2800,6 +2820,19 @@ void process_enter(int option) {
       break;
     }
     
+    if (strcmp(radio->callsign + 2, "WIPEKEYSWAP") == 0) {
+      plogw->wipe_key_swap = 1 - plogw->wipe_key_swap;
+      save_settings("");
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "WIPE KEY SWAP=%d\nAlt-W: %s\nCtrl-W: %s",
+               plogw->wipe_key_swap,
+               plogw->wipe_key_swap ? "clear field" : "wipe QSO",
+               plogw->wipe_key_swap ? "wipe QSO" : "clear field");
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+    
     if (strcmp(radio->callsign+2,"OFFCONTEST")==0) {
       // toggle on/off contest flag
       plogw->f_off_contest=1;
@@ -3047,6 +3080,34 @@ void process_enter(int option) {
       clear_buf(radio->callsign);
       break;
     }
+    if (strcmp(radio->callsign + 2, "XITON") == 0 ||
+        strcmp(radio->callsign + 2, "XITOFF") == 0 ||
+        strcmp(radio->callsign + 2, "XITRESET") == 0) {
+      const char *cmd = radio->callsign + 2;
+      if (!xit_control_supported(radio)) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "XIT unsupported\n%s", radio->rig_spec->name);
+      } else if (strcmp(cmd, "XITON") == 0) {
+        radio->xit_enabled = true;
+        apply_xit_for_operating_mode(radio);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "XIT ON\n%+d Hz\n%s", radio->xit_offset_hz,
+                 radio->cq[radio->modetype] == LOG_SandP ? "S&P" : "CQ: forced 0");
+      } else if (strcmp(cmd, "XITRESET") == 0) {
+        radio->xit_offset_hz = 0;
+        apply_xit_for_operating_mode(radio);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "XIT RESET\n0 Hz");
+      } else {
+        radio->xit_enabled = false;
+        set_xit_control(radio, false);
+        set_xit_offset_hz(radio, 0);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "XIT OFF\nsaved %+d Hz", radio->xit_offset_hz);
+      }
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
     if (strcmp(radio->callsign + 2, "CLOCKSYNC") == 0) {
       int n = request_icom_clock_sync_all();
       plogw->ostream->printf(
@@ -3189,6 +3250,28 @@ void process_enter(int option) {
       }
       clear_buf(radio->callsign);      
       break;
+    }
+
+    // A dot is easier to type than slash on some compact keyboards.  Keep it
+    // untouched until all CALLSIGN-field commands/mode/frequency parsing has
+    // failed, so e.g. "14.074" is still interpreted as a frequency.  Only
+    // when the remaining text is going to be treated as a callsign do we use
+    // '.' as an alias for '/'.
+    bool callsign_dot_alias = false;
+    for (char *q = radio->callsign + 2; *q != '\0'; ++q) {
+      if (*q == '.') {
+        *q = '/';
+        callsign_dot_alias = true;
+      }
+    }
+    if (callsign_dot_alias) {
+      radio->callsign[1] = strlen(radio->callsign + 2);
+
+      // The live DUPE/CALLHIST/partial query was made while the edit buffer
+      // still contained '.'.  Start a fresh query for the normalized call so
+      // S&P Enter cannot reuse a stale result for the dot spelling.
+      request_async_dupe_partial(radio, true);
+      request_dupe_aware_display_update();
     }
 
     // ESM
@@ -3432,7 +3515,7 @@ void logw_handler(char key, char c)
     }
     
     if (ptr_curr_req_callsign_exch_chr(radio)) {
-      if (!(isalnum(c)||(c=='/')||(c=='.')||
+      if (!(isalnum(c)||(c=='/')||(c=='.')||(c=='-')||
             (radio->ptr_curr == 1 && c==','))) { // callsign/exchange characters
         return ;
       }

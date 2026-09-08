@@ -273,6 +273,7 @@ void init_logwindow() {
 
   //plogw = (struct logwindow *)malloc(sizeof (struct logwindow));
   plogw->f_esm=0;
+  plogw->wipe_key_swap=0;
   plogw->show_smeter = 1;
   plogw->show_qso_interval=0;
   plogw->qso_interval_timer=0;
@@ -680,7 +681,7 @@ static int dupe_partial_check_local(const char *call,
 
   for (int i = 0; i < dupechk->ncallsign; i++) {
     const char *callsign = dupechk->callsign[i];
-    if (strstr(callsign, call) == NULL) continue;
+    if (!dupe_callsign_partial_match(callsign, call)) continue;
 
     struct check_entry *entry = &entry_list->entryl[entry_list->nentry];
     entry->flag = CHECK_ENTRY_FLAG_DUPECHECK_LIST;
@@ -688,7 +689,8 @@ static int dupe_partial_check_local(const char *call,
     strcpy(entry->exch, dupechk->exch[i]);
     entry->bandmode = dupechk->bandmode[i];
 
-    if (len == strlen(callsign)) {
+    if (strchr(call, '-') == NULL && len == strlen(callsign) &&
+        dupe_callsign_equal(callsign, call)) {
       entry->flag |= CHECK_ENTRY_FLAG_EXACT_MATCH;
       if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
         entry->flag |= CHECK_ENTRY_FLAG_DUPE;
@@ -764,9 +766,10 @@ int dupe_partial_check(const char *call,unsigned char bandmode,unsigned char mas
       if (callsign!=NULL) {
 	exch=strtok(NULL," ");
 	if (exch!=NULL) {
-	  // check the callsign by strstr
-	  part=strstr(callsign,call);
-	  if (part!=NULL) { // substring call found in target callsign in dupechk list
+	  // Ordinary entry keeps substring matching; RTTY '-' is a one-character
+	  // wildcard over the complete callsign.
+	  part = dupe_callsign_partial_match(callsign, call) ? callsign : NULL;
+	  if (part!=NULL) { // partial/wildcard call found
 	    // check if the same entry (s) already exists in the list
 	    for (int j=0;j<entry_list->nentry;j++) {
 	      if (strcmp(entry_list->entryl[j].callsign,callsign)==0) {
@@ -778,7 +781,8 @@ int dupe_partial_check(const char *call,unsigned char bandmode,unsigned char mas
 	    strcpy(entry->exch,exch);
 	    entry->flag|=CHECK_ENTRY_FLAG_CALLHIST_LIST;
 	    entry_list->nentry++;
-	    if (len == strlen(callsign)) {
+	    if (strchr(call, '-') == NULL && len == strlen(callsign) &&
+              dupe_callsign_equal(callsign, call)) {
 	      // exact match
 	      entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
 	    }
@@ -859,13 +863,13 @@ int dupe_callhist_check(const char *call,unsigned char bandmode, unsigned char m
     if ((ret == 0) || (f_callhist == 1)) {
       if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
         // current band and mode
-        if (strcmp(dupechk->callsign[i], call) == 0) {
+        if (dupe_callsign_equal(dupechk->callsign[i], call)) {
           // dupe
           ret = 1;
         }
       } else if (f_callhist) {
         // other band and mode
-        if (strcmp(dupechk->callsign[i], call) == 0) {
+        if (dupe_callsign_equal(dupechk->callsign[i], call)) {
           // hit !
           *exch_history=dupechk->exch[i];
           f_callhist = 0;  // no longer need to search for history

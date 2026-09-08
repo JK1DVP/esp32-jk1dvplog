@@ -33,6 +33,7 @@ void select_left_display() ;
 void select_right_display() ;
 void display_printStr(const char *s, byte ycol) ;
 void upd_display_info_flash(const char *s) ;
+void upd_display_rtty_decoder(const char *s) ;
 void upd_display_tm() ;
 void upd_display_stat() ;
 int upd_cursor_calc(int cursor, int wsize);

@@ -55,6 +55,8 @@ void init_cw_keying();
 int send_the_dits_and_dahs(const char *cw_to_send) ;
 void send_bits(byte code, int fig, int *figures) ;
 void send_baudot(byte ascii, int *figures);
+void RTTYbaudotDiagReset();
+void RTTYbaudotDiagDump(Print *out);
 void send_char(byte cw_char, byte omit_letterspace) ;
 void set_tx_to_focused() ;
 void set_tx_to_manual_radio(int radio_idx);
@@ -68,6 +70,8 @@ char *power_code(int bandid);
 // char *expand_macro_string(char *p,char *s) ; // expand macro string s to p older
 char *expand_macro_string(char *p,size_t p_size, const char *s) ; // expand macro string s to p
 void append_cwbuf_string(const char *s) ;
+void append_rtty_test1(char ch, int n);
+void append_rtty_test_text(const char *s);
 int cw_wptr_cw_send_buf_previous() ;
 void delete_cwbuf();
 void cancel_keying(struct radio *radio); // here radio indicates currently transmitting radio
@@ -85,5 +89,7 @@ extern int cw_duty_ratio ;
 extern int f_so2r_chgstat_tx ;  // nonzero if changing so2r transmit requested
 extern int f_so2r_chgstat_rx ;  // nonzero if changing so2r receive requested
 extern int f_transmission ;     // 0 nothing   1 force transmission on active trx 2
+extern int cw_count_ms;          // CW/RTTY scheduler countdown (ms)
+extern volatile bool f_rtty_usb_lead_pending; // USB RTTY lead waits for PTT ON in main loop
 //Ticker cw_sender, civ_reader;
 #endif

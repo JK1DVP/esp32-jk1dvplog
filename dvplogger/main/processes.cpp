@@ -194,8 +194,11 @@ void interval_process() {
       if (!unique_num_radio(i)) continue;
       radio = &radio_list[i];
       if (!radio->enabled) continue;
-      // query item map
-      // query_items[]={ 0,1,2,3,4,5, 0,1,2,3,4,6, 0,1,2,3,4,7, 0,1,2,3,4,5
+      // Common 600-ms query sequence (100 ms per step):
+      //   normal:      Freq, Mode, Smeter, Freq, silence, slow query
+      //   show_signal: Freq, Smeter, Smeter, Freq, silence, slow query
+      // Freq is queried at stat 0 and 3: every 300 ms.
+      // GPS and other slow/status items are handled by query_item.
       if (!radio->f_civ_response_expected) {
 	if (!plogw->f_show_signal) {
 	  // normal 
@@ -204,49 +207,43 @@ void interval_process() {
 	    send_query_civ(Freq,radio); break;
 	  case 1:
 	    send_query_civ(Mode,radio); break;
-	    break;
 	  case 2:
 	    send_query_civ(Smeter,radio); break;	    
-	    break;
 	  case 3:
-	    //	    send_query_civ(Ptt,radio); break;
-	    send_query_civ(Gps,radio); break;       // 6	      	    
-	    break;
+	    send_query_civ(Freq,radio); break;
 	  case 4:  // silence period for rotator //4 
 	    break;
-	  case 5:  // ATT query or other information query
+	  case 5:  // slow/status query
 	    switch(query_item) {
 	    case 0:send_query_civ(Id,radio); break;	    	    
-	    case 1:send_query_civ(Ptt,radio); break;       // 6
-	    case 2:send_query_civ(Freq,radio); break;       // 6
-	    case 3:send_query_civ(Mode,radio); break;       // 6
-	    case 4:send_query_civ(Smeter,radio); break;	    
-	    case 5:send_query_civ(Preamp,radio); break;       // 6
-	    case 6:send_query_civ(Ptt,radio); break;        // 6
-	    case 7:send_query_civ(Freq,radio); break;       // 6
-	    case 8:send_query_civ(Mode,radio); break;       // 6
-	    case 9:send_query_civ(Smeter,radio); break;	    
-	    case 10:send_query_civ(Att,radio); break;       // 6
-	    case 11:send_query_civ(Gps,radio); break;       // 6	    
-	    case 12:send_query_civ(Power,radio); break;
+	    case 1:send_query_civ(Ptt,radio); break;
+	    case 2:send_query_civ(Mode,radio); break;
+	    case 3:send_query_civ(Smeter,radio); break;	    
+	    case 4:send_query_civ(Preamp,radio); break;
+	    case 5:send_query_civ(Ptt,radio); break;
+	    case 6:send_query_civ(Mode,radio); break;
+	    case 7:send_query_civ(Smeter,radio); break;	    
+	    case 8:send_query_civ(Att,radio); break;
+	    case 9:send_query_civ(Gps,radio); break;
+	    case 10:send_query_civ(Power,radio); break;
 	    }
 	    query_item++;
-	    if (query_item >= 13) query_item = 0;
+	    if (query_item >= 11) query_item = 0;
 	    break;
 	  }
 	} else {
 	  // show signal 
 	  switch (interval_process_stat) {  
 	  case 0:
+	    send_query_civ(Freq,radio); break;
 	  case 1:
 	  case 2:
+	    send_query_civ(Smeter,radio); break;
 	  case 3:
-	    send_query_civ(Gps,radio); break;       // 6	      	    	    
-	    //	    send_smeter_query_civ(radio);//2
-	    break;
+	    send_query_civ(Freq,radio); break;
 	  case 4:  // silence period for rotator //4 
 	    break;
-	  case 5:  // ATT query or other information query 
+	  case 5:  // slow/status query 
 	    switch(query_item) {
 	    case 0:send_query_civ(Id,radio); break;	    	    
 	    case 1:send_query_civ(Ptt,radio); break;       // 6
@@ -263,7 +260,7 @@ void interval_process() {
 	    case 12:send_query_civ(Power,radio); break;
 	    }
 	    query_item++;
-	    if (query_item >= 13) query_item = 0;
+	    if (query_item >= 11) query_item = 0;
 	    break;
 	  }
 	}

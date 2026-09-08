@@ -59,6 +59,10 @@
 #include <algorithm>
 #include <memory>
 
+
+#ifndef BANDMAP_TRACE
+#define BANDMAP_TRACE 0
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
@@ -142,7 +146,7 @@ static String normalize_op_value(int index, const String &source) {
     bool accept = false;
     switch (index) {
       case 0: case 1:
-        accept = ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '.');
+        accept = ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '.' || c == '-');
         break;
       case 4:
         // Sent Exch is a CW macro source.  Preserve characters such as '$'
@@ -1337,7 +1341,19 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
   <h2>DVPlogger RIG Settings</h2>
 <p>Separated args by ,(comma)</p>
 <ul>
-  <li><strong>CW:<em>cwport</em></strong> (1–3)</li>
+  <li><strong>CW:<em>port</em></strong> CW key output:
+    0=LED/GPIO, 1=KEY1, 2=KEY2, 3=USB DTR, 4=USB RTS.
+    For USB rigs, select the line matching the rig's PC KEYING setting.</li>
+  <li><strong>FSK:<em>port</em></strong> RTTY FSK key output:
+    0=LED/GPIO, 1=KEY1, 2=KEY2, 3=USB DTR, 4=USB RTS.
+    CW and FSK are independent. If omitted, FSK uses the CW port for backward compatibility.</li>
+  <li><strong>RP:<em>0|1</em></strong> per-rig RTTY polarity:
+    0=normal, 1=reverse. If omitted, the legacy/global <code>rttyinvert</code> setting is used.</li>
+  <li><strong>PTT:<em>0..4</em></strong> additional PTT method:
+    0/1=don't care (none), 2=CAT/CI-V, 3=USB DTR, 4=USB RTS.<br>
+    Hardware MIC/PTT is independent of this setting:
+    Radio0&rarr;PTT1, Radio1&rarr;PTT2, Radio2&rarr;PTT3.
+    Therefore <code>PTT:2</code> means hardware PTT plus CAT/CI-V PTT.</li>
   <li><strong>B:<em>baudrate</em></strong></li>
   <li><strong>P:<em>catport_number</em></strong> ((-2:Manual) ‑1:USB, 1:Bluetooth, 2:CI‑V, 3:CAT, 4:CAT2)</li>
   <li><strong>ADR:<em>CI‑V_address</em></strong></li>
@@ -1365,6 +1381,10 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
     Manual = TP:3_4, QMX = TP:7_8, ATS Mini = TP:8_9
   </li>
 </ul>
+<h3>CW / RTTY example</h3>
+<p><code>CW:4,FSK:3,PTT:2,RP:0</code> means CW=USB RTS, RTTY FSK=USB DTR,
+RADIO-associated hardware PTT + CAT/CI-V PTT, and normal RTTY polarity.</p>
+<p>If MARK/SPACE polarity is reversed, change <code>RP:0</code> to <code>RP:1</code>.</p>
 <p>Press Enter or tap Apply beside an input box to reflect changes.</p>
 <p><a href="/" >go back to Home</a></p>
 <button type="button" onclick="saveRigs();">Save RIGs</button>
@@ -1397,7 +1417,7 @@ async function updateBandmapLifetime() {
     });
 }
 
-function updateSetting(index) {
+async function updateSetting(index) {
   const input = document.getElementById('edit_' + index);
   if (!input || rigUpdateInProgress) return;
 
@@ -1416,9 +1436,15 @@ function updateSetting(index) {
     // rig_spec[] is the single source of truth.  Always show the string
     // regenerated from the RAM structure, never a browser-only edit.
     input.value = canonical;
+    input.dataset.canonical = canonical;
     rigsDirty = true;
     setRigStatus(`RIG ${index} updated in RAM (not saved yet).`, "dirty");
   } catch (error) {
+    // Keep the browser field consistent with the unchanged RAM setting when
+    // the update is rejected (for example, a duplicate NAME).
+    if (input.dataset.canonical !== undefined) {
+      input.value = input.dataset.canonical;
+    }
     setRigStatus(`Update failed: ${error.message}`, "error");
   } finally {
     rigUpdateInProgress = false;
@@ -1465,6 +1491,9 @@ window.addEventListener('beforeunload', event => {
 document.addEventListener("DOMContentLoaded", () => {
   const inputs = document.querySelectorAll("input[type=text]");
   inputs.forEach(input => {
+    if (input.id && input.id.startsWith("edit_")) {
+      input.dataset.canonical = input.value;
+    }
     input.addEventListener("keydown", function(event) {
       if (event.key === "Enter") {
         event.preventDefault();
@@ -2319,10 +2348,15 @@ void setupSettingsPageHandler() {
               print_rig_spec_str(state.rig_index, spec_buf);
               spec_buf[sizeof(spec_buf) - 1] = '\0';
 
+              char rig_label[40];
+              snprintf(rig_label, sizeof(rig_label), "RIG %d: %s",
+                       state.rig_index,
+                       rig_spec[state.rig_index].name);
+
               const int len = snprintf(state.line, sizeof(state.line),
                                        example_input_html,
                                        state.rig_index,
-                                       rig_spec[state.rig_index].name,
+                                       rig_label,
                                        state.rig_index,
                                        state.rig_index,
                                        spec_buf,
@@ -2495,18 +2529,11 @@ void setupSettingsPageHandler() {
       return;
     }
 
-    set_rig_spec_from_str_rig(&rig_spec[index], value.c_str());
-
-    // radio->rig_spec already points at rig_spec[index].  Refresh the
-    // cached display string/name and band mask for every radio using it.
-    for (int i = 0; i < N_RADIO; ++i) {
-      if (radio_list[i].rig_spec_idx != index) continue;
-      radio_list[i].rig_spec = &rig_spec[index];
-      strlcpy(radio_list[i].rig_name + 2,
-              rig_spec[index].name,
-              sizeof(radio_list[i].rig_name) - 2);
-      set_rig_spec_str_from_spec(&radio_list[i]);
-      radio_list[i].band_mask = rig_spec[index].band_mask;
+    char rig_update_err[96];
+    if (!update_rig_spec(index, value.c_str(),
+                         rig_update_err, sizeof(rig_update_err))) {
+      request->send(409, "text/plain", rig_update_err);
+      return;
     }
 
     char spec_buf[300];
@@ -3954,12 +3981,14 @@ static void *web_bandmap_alloc(size_t size, bool prefer_psram) {
 
 static void web_bandmap_heap_trace(const char *tag) {
   if (!lowmem_trace) return;
+  #if BANDMAP_TRACE
   webLog.printf("[BANDMAPTRACE] web %-22s free=%u largest=%u min=%u snapshots=%u\n",
                 tag,
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                 (unsigned)web_bandmap_snapshot_count);
+  #endif
 }
 
 static void free_web_bandmap_snapshots() {
@@ -4021,12 +4050,14 @@ static bool ensure_web_bandmap_snapshots() {
   web_bandmap_has_psram = psram_total > 0;
 
   if (lowmem_trace) {
+    #if BANDMAP_TRACE
     webLog.printf("[BANDMAPTRACE] layout snapshot=%u entry=%u bands=%u psram_total=%u psram_free=%u\n",
                   (unsigned)sizeof(WebBandmapSnapshot),
                   (unsigned)sizeof(WebBandmapEntry),
                   (unsigned)WEB_BANDMAP_BANDS,
                   (unsigned)psram_total,
                   (unsigned)psram_free);
+    #endif
   }
 
   bool allocated = false;

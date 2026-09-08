@@ -42,6 +42,11 @@
 
 void receive_pkt_handler_keyboard1_main(struct mux_packet *packet);
 
+// Feed decoded RTTY text into the same display/autofill path used by the
+// IC-705 second CDC interface.  Useful for terminal diagnostics as well.
+void RTTYDecoderFeedText(const char *text, bool append_newline = false);
+void RTTYDecoderResetAutofill();
+
 #define KEYMSG_TYPE_ONCONTROLKEYSCHANGED 1
 #define KEYMSG_TYPE_HANDLELOCKINGKEYS 2
 #define KEYMSG_TYPE_ONKEYDOWN 3
@@ -126,13 +131,48 @@ class KbdRptParser : public KeyboardReportParser {
 extern KbdRptParser Prs,Prs1;
 
 void USB_desc(); // print usb descriptors
+bool usb_audio_capture_active();
+bool usb_audio_capture_start(Print *out);
+void usb_audio_capture_stop(Print *out);
+void usb_audio_capture_status(Print *out);
+void usb_audio_capture_free(Print *out);
+void usb_audio_capture_diagnose(Print *out);
+void usb_audio_capture_set_sof_sync(bool enable, Print *out);
+bool usb_audio_capture_sof_sync();
+const int16_t *usb_audio_capture_buffer();
+size_t usb_audio_capture_samples();
+uint32_t usb_audio_capture_sample_rate();
 void ACMprocess() ;
 bool usb_qmx_cat_ready();
 bool usb_cat_ready_for_rig_type(uint8_t cat_type);
+// Deferred CDC ACM DTR/RTS keying.  cwport 3=DTR, 4=RTS.
+// usb_keying_request() is safe to call from the 1-ms CW ticker callback;
+// the actual USB control transfer is performed later by loop_usb().
+void usb_keying_request(uint8_t cwport, bool on);
+void usb_keying_process();
+// USB RTTY scheduler.  The 1-ms CW ticker only enqueues symbol states;
+// loop_usb() applies them at measured 45.45-baud symbol boundaries so USB
+// control-transfer jitter cannot collapse consecutive Baudot bits.
+bool usb_rtty_begin(uint8_t cwport, uint32_t lead_ms, bool invert);
+bool usb_rtty_symbol_request(uint8_t cwport, bool mark, uint32_t duration_us);
+bool usb_rtty_end_request(uint8_t cwport);
+bool usb_rtty_take_tx_done();
+void USBRTTYsetInvert(bool invert, Print *out = nullptr);
+bool USBRTTYgetInvert();
+// True while the USB RTTY scheduler needs sub-symbol polling latency.
+bool usb_rtty_fast_service_needed();
+void USBRTTYtimingStatus(Print *out = nullptr);
+void USBRTTYtimingDump(Print *out = nullptr);
+void USBACMstatus(Print *out = nullptr);
+bool USBACMselectKeyInterface(uint8_t iface, Print *out = nullptr);
+bool USBACMcontrolTest(uint8_t state, Print *out = nullptr);
 void CP2105process();
 void CP2105status(Stream *out = nullptr);
 bool CP2105selectPort(uint8_t port);
 bool CP2105setBaud(uint8_t port, uint32_t baudrate);
+bool CP2105controlTest(uint8_t port, char line, bool on, Stream *out = nullptr);
+bool CP2105flowStatus(uint8_t port, Stream *out = nullptr);
+bool CP2105setManualFlow(uint8_t port, Stream *out = nullptr);
 void CP2105toggleDebug();
 bool CP2105sendRaw(uint8_t port, const char *text);
 void init_usb();

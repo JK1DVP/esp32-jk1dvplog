@@ -55,6 +55,63 @@ void note_makedupe_accepted_maincpu() {
 extern int f_spiram;
 
 struct dupechk *dupechk=NULL;
+
+// Remove only a conservative set of trailing portable suffixes for exact
+// DUPE/CALLHIST comparison.  Prefix operations such as F/JA1ABC and
+// KH0/JA1ABC are deliberately preserved.
+bool normalize_dupe_callsign(const char *src, char *dst, size_t dst_size) {
+  if (dst == NULL || dst_size == 0) return false;
+  dst[0] = '\0';
+  if (src == NULL) return false;
+  strlcpy(dst, src, dst_size);
+
+  char *slash = strrchr(dst, '/');
+  if (slash == NULL || slash == dst || slash[1] == '\0') return false;
+  const char *suffix = slash + 1;
+  bool portable = false;
+  if (suffix[1] == '\0' && suffix[0] >= '0' && suffix[0] <= '9') portable = true;
+  else if (strcasecmp(suffix, "P") == 0 ||
+           strcasecmp(suffix, "M") == 0 ||
+           strcasecmp(suffix, "MM") == 0 ||
+           strcasecmp(suffix, "AM") == 0 ||
+           strcasecmp(suffix, "QRP") == 0) portable = true;
+  if (!portable) return false;
+
+  *slash = '\0';
+  return true;
+}
+
+bool dupe_callsign_equal(const char *a, const char *b) {
+  char na[LEN_CALLSIGN + 1];
+  char nb[LEN_CALLSIGN + 1];
+  normalize_dupe_callsign(a, na, sizeof(na));
+  normalize_dupe_callsign(b, nb, sizeof(nb));
+  return strcasecmp(na, nb) == 0;
+}
+
+bool dupe_callsign_partial_match(const char *candidate, const char *pattern) {
+  if (candidate == NULL || pattern == NULL || *pattern == '\0') return false;
+
+  // RTTY autofill uses '-' as a single unknown character.  Keep this
+  // deliberately different from the ordinary substring partial check: an
+  // uncertain callsign represents the whole callsign and therefore must have
+  // the same length.
+  if (strchr(pattern, '-') != NULL) {
+    const size_t nc = strlen(candidate);
+    const size_t np = strlen(pattern);
+    if (nc != np) return false;
+    for (size_t i = 0; i < np; ++i) {
+      if (pattern[i] == '-') continue;
+      if (toupper((unsigned char)candidate[i]) !=
+          toupper((unsigned char)pattern[i])) return false;
+    }
+    return true;
+  }
+
+  // Historical behaviour for normal operator partial entry.
+  return strstr(candidate, pattern) != NULL || dupe_callsign_equal(candidate, pattern);
+}
+
 static volatile bool dupechk_reset_ack = false;
 static volatile bool makedupe_done_ack = false;
 static bool makedupe_score_received[2] = {false, false};
@@ -432,7 +489,6 @@ void process_dupechk_partial_query_subcpu(char *s) {
   size_t used;
   int count = 0;
   int ndupe = 0;
-  int call_len;
   uint32_t qso_start_us, qso_us, hist_start_us, hist_us = 0;
   unsigned int qso_scanned = 0, hist_scanned = 0;
   char matched_qso[10][LEN_CALLSIGN + 1];
@@ -447,13 +503,14 @@ void process_dupechk_partial_query_subcpu(char *s) {
   }
 
   if (max_entries > 10) max_entries = 10;
-  call_len = strlen(call);
   used = snprintf(response, sizeof(response), "dupepr:%u|0|0", query_id);
 
   qso_start_us = micros();
   for (int i = 0; i < dupechk->ncallsign && count < (int)max_entries; i++) {
     qso_scanned++;
-    if (strstr(dupechk->callsign[i], call) == NULL) continue;
+    const bool uncertain = strchr(call, '-') != NULL;
+    const bool exact_match = !uncertain && dupe_callsign_equal(dupechk->callsign[i], call);
+    if (!dupe_callsign_partial_match(dupechk->callsign[i], call)) continue;
     if (nmatched_qso < 10) {
       strncpy(matched_qso[nmatched_qso], dupechk->callsign[i], LEN_CALLSIGN);
       matched_qso[nmatched_qso][LEN_CALLSIGN] = '\0';
@@ -461,7 +518,7 @@ void process_dupechk_partial_query_subcpu(char *s) {
     }
 
     int flags = CHECK_ENTRY_FLAG_DUPECHECK_LIST;
-    if (call_len == (int)strlen(dupechk->callsign[i])) {
+    if (exact_match) {
       flags |= CHECK_ENTRY_FLAG_EXACT_MATCH;
       if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
         flags |= CHECK_ENTRY_FLAG_DUPE;
@@ -491,14 +548,17 @@ void process_dupechk_partial_query_subcpu(char *s) {
   for (int ci = 0; ci < get_callhist_subcpu_count() && count < (int)max_entries; ci++) {
     hist_scanned++;
     const char *hc = NULL, *he = NULL;
-    if (!get_callhist_subcpu_entry(ci, &hc, &he) || strstr(hc, call) == NULL) continue;
+    if (!get_callhist_subcpu_entry(ci, &hc, &he)) continue;
+    const bool uncertain = strchr(call, '-') != NULL;
+    const bool exact_match = !uncertain && dupe_callsign_equal(hc, call);
+    if (!dupe_callsign_partial_match(hc, call)) continue;
     bool already = false;
     for (int j = 0; j < nmatched_qso; j++) {
       if (strcmp(matched_qso[j], hc) == 0) { already = true; break; }
     }
     if (already) continue;
     int flags = CHECK_ENTRY_FLAG_CALLHIST_LIST;
-    if (call_len == (int)strlen(hc)) flags |= CHECK_ENTRY_FLAG_EXACT_MATCH;
+    if (exact_match) flags |= CHECK_ENTRY_FLAG_EXACT_MATCH;
     char item[64];
     int item_len = snprintf(item, sizeof(item), "|%s,%s,0,%d", hc, he && *he ? he : "-", flags);
     if (item_len <= 0 || used + (size_t)item_len >= sizeof(response)) break;
@@ -581,8 +641,14 @@ void request_async_dupe_partial(struct radio *radio, bool include_partial) {
   }
 
   if (dupechk->dupechk_at != 1) {
-    radio->dupe = dupe_check(radio, radio->callsign + 2, bandmode(radio),
-                             plogw->mask, true) ? 1 : 0;
+    // '-' is an RTTY decoder uncertainty marker, not a literal callsign
+    // character.  Never declare an exact DUPE while it remains; use only the
+    // partial candidate list.
+    if (strchr(radio->callsign + 2, '-') == NULL)
+      radio->dupe = dupe_check(radio, radio->callsign + 2, bandmode(radio),
+                               plogw->mask, true) ? 1 : 0;
+    else
+      radio->dupe = 0;
     if (include_partial && (plogw->f_partial_check & PARTIAL_CHECK_CALLSIGN_AUTO))
       ui_perform_partial_check(radio);
     return;
@@ -662,7 +728,6 @@ static void append_main_callhist_partial(const char *call,
   if (!call || !*call || !entry_list || !plogw->enable_callhist ||
       callhist_at != 0 || callhist_list == NULL) return;
 
-  const size_t call_len = strlen(call);
   for (int i = 0; i < n_callhist_list &&
                   entry_list->nentry < entry_list->nmax_entry &&
                   entry_list->nentry < 10; ++i) {
@@ -673,7 +738,8 @@ static void append_main_callhist_partial(const char *call,
     if (!sp) continue;
     *sp++ = '\0';
     while (*sp == ' ') ++sp;
-    if (strstr(item, call) == NULL) continue;
+    const bool exact_match = dupe_callsign_equal(item, call);
+    if (strstr(item, call) == NULL && !exact_match) continue;
 
     bool duplicate = false;
     for (int j = 0; j < entry_list->nentry; ++j) {
@@ -688,7 +754,7 @@ static void append_main_callhist_partial(const char *call,
     strlcpy(e->callsign, item, sizeof(e->callsign));
     strlcpy(e->exch, sp, sizeof(e->exch));
     e->flag = CHECK_ENTRY_FLAG_CALLHIST_LIST;
-    if (call_len == strlen(e->callsign)) e->flag |= CHECK_ENTRY_FLAG_EXACT_MATCH;
+    if (exact_match) e->flag |= CHECK_ENTRY_FLAG_EXACT_MATCH;
   }
 }
 
@@ -817,7 +883,7 @@ bool dupe_check_nocallhist(const char *call, byte bandmode, byte mask) {
   int ret = 0;
   for (int i = 0; i < dupechk->ncallsign; i++) {
     if ((dupechk->bandmode[i] & mask) == (bandmode & mask) &&
-        strcmp(dupechk->callsign[i], call) == 0) {
+        dupe_callsign_equal(dupechk->callsign[i], call)) {
       ret = 1;
       break;
     }
@@ -844,7 +910,7 @@ bool dupe_check_with_exch(const char *call, byte bandmode, byte mask,
   bool dupe = false;
   bool have_exch = false;
   for (int i = dupechk->ncallsign - 1; i >= 0; i--) {
-    if (strcmp(dupechk->callsign[i], call) != 0) continue;
+    if (!dupe_callsign_equal(dupechk->callsign[i], call)) continue;
     if (!have_exch && exch && exch_size && dupechk->exch[i][0]) {
       strncpy(exch, dupechk->exch[i], exch_size - 1);
       exch[exch_size - 1] = '\0';
@@ -946,7 +1012,7 @@ void process_dupechk_query_subcpu(char *s) {
     // bandmap checks use this exact-match path and avoid the partial/history scan.
     for (int i = dupechk->ncallsign - 1; i >= 0; i--) {
       qso_scanned++;
-      if (strcmp(dupechk->callsign[i], callsign) != 0) continue;
+      if (!dupe_callsign_equal(dupechk->callsign[i], callsign)) continue;
       if (want_exch && !has_exch && dupechk->exch[i][0] != '\0') {
         strncpy(exch, dupechk->exch[i], LEN_EXCH);
         exch[LEN_EXCH] = '\0';
@@ -1047,7 +1113,7 @@ bool dupe_check_get_callhist(char *call, byte bandmode, byte mask, bool callhist
 
       if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
         // current band and mode
-        if (strcmp(dupechk->callsign[i], call) == 0) {
+        if (dupe_callsign_equal(dupechk->callsign[i], call)) {
           // dupe
           if (verbose & 1) {
             plogw->ostream->println("dupe");
@@ -1056,7 +1122,7 @@ bool dupe_check_get_callhist(char *call, byte bandmode, byte mask, bool callhist
         }
       } else if (*f_callhist) {
         // other band and mode
-        if (strcmp(dupechk->callsign[i], call) == 0) {
+        if (dupe_callsign_equal(dupechk->callsign[i], call)) {
           // hit !
 
           strcpy(getexch, dupechk->exch[i]);	  
@@ -1141,16 +1207,29 @@ void process_makedupe_score_maincpu(char *s, int group) {
     makedupe_done_ack = true;
 }
 
-void finish_makedupe_subcpu() {
-  if (dupechk == NULL || dupechk->dupechk_at != 1) return;
+static bool makedupe_finish_pending = false;
+static uint32_t makedupe_finish_timeout = 0;
+
+void start_finish_makedupe_subcpu() {
+  if (dupechk == NULL || dupechk->dupechk_at != 1) {
+    makedupe_finish_pending = false;
+    return;
+  }
   makedupe_done_ack = false;
   mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
                          (unsigned char *)"dupebulkend", strlen("dupebulkend"));
-  uint32_t timeout = millis() + 5000;
-  while (!makedupe_done_ack && (int32_t)(millis() - timeout) < 0) {
-    if (f_mux_transport) mux_transport.recv_pkt();
-    delay(1);
-  }
+  makedupe_finish_timeout = millis() + 5000;
+  makedupe_finish_pending = true;
+}
+
+bool poll_finish_makedupe_subcpu() {
+  if (!makedupe_finish_pending) return true;
+  if (f_mux_transport) mux_transport.recv_pkt();
+  if (!makedupe_done_ack &&
+      (int32_t)(millis() - makedupe_finish_timeout) < 0)
+    return false;
+
+  makedupe_finish_pending = false;
 
   uint32_t worked_total = 0;
   for (int group = 0; group < 2; group++) {
@@ -1172,6 +1251,13 @@ void finish_makedupe_subcpu() {
     memset(score.nmulti, 0, sizeof(score.nmulti));
     clear_multi_worked();
   }
+  return true;
+}
+
+void finish_makedupe_subcpu() {
+  if (dupechk == NULL || dupechk->dupechk_at != 1) return;
+  start_finish_makedupe_subcpu();
+  while (!poll_finish_makedupe_subcpu()) delay(1);
 }
 
 void entry_dupechk_data(const char *callsign, const char *recv_exch, unsigned char bandmode) {
@@ -1300,7 +1386,7 @@ void entry_makedupe_bulk_subcpu(char *s) {
   for (int i = 0; i < dupechk->ncallsign; i++) {
     if (((dupechk->bandmode[i] & makedupe_bulk_mask) ==
          (((unsigned char)bandmode) & makedupe_bulk_mask)) &&
-        strcmp(dupechk->callsign[i], callsign) == 0) {
+        dupe_callsign_equal(dupechk->callsign[i], callsign)) {
       return;
     }
   }

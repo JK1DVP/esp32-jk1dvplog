@@ -95,7 +95,7 @@ extern int wifi_count ;
 extern int wifi_status;
 extern int count ;
 extern uint8_t *dispbuf_r, *dispbuf_l;
-extern int enable_usb_keying;
+extern int rtty_ptt_lead_ms;
 extern int rtcadj_count;
 extern int clock_display_mode; // 0: JST (internal UTC+9), 1: UTC display
 extern int rig_clock_sync;     // auto-sync supported Icom clocks on CI-V connect/reconnect

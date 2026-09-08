@@ -1214,6 +1214,19 @@ static void append_qso_backup_line(int number) {
 
 static volatile bool pending_makedupe_rebuild = false;
 
+struct makedupe_rebuild_context {
+  bool active;
+  bool waiting_subcpu_finish;
+  int pos;
+  int count;
+  int len;
+  uint32_t started_ms;
+  uint32_t next_record_ms;
+};
+
+static struct makedupe_rebuild_context makedupe_rebuild = {};
+static File makedupe_rebuild_file;
+
 void request_makedupe_rebuild()
 {
   pending_makedupe_rebuild = true;
@@ -1224,9 +1237,30 @@ bool qso_file_operation_busy()
   return qso_file_op.state != QSO_FILE_OP_IDLE;
 }
 
-void process_pending_makedupe_rebuild()
+static void finish_incremental_makedupe_rebuild()
 {
-  if (!pending_makedupe_rebuild) return;
+  close_qso_log_readonly(&makedupe_rebuild_file);
+  makedupe_diag_finish();
+  if (makedupe_main_overflow_count != 0) {
+    console->printf(
+      "MAKEDUPE MAIN fallback: database full; %lu additional unique QSOs "
+      "not stored (capacity=%d)\n",
+      (unsigned long)makedupe_main_overflow_count,
+      get_dupechk_nmaxqso());
+  }
+
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+           "MAKEDUPE\nFinished\nQSO %d", makedupe_rebuild.count);
+  upd_display_info_flash(dp->lcdbuf);
+  console->printf("MAKEDUPE incremental finished QSO=%d elapsed=%lu ms\n",
+                  makedupe_rebuild.count,
+                  (unsigned long)(millis() - makedupe_rebuild.started_ms));
+  makedupe_rebuild.active = false;
+  makedupe_rebuild.waiting_subcpu_finish = false;
+}
+
+static void start_incremental_makedupe_rebuild()
+{
   pending_makedupe_rebuild = false;
 
   init_score();
@@ -1253,14 +1287,107 @@ void process_pending_makedupe_rebuild()
   }
 
   makedupe_diag_begin();
-  read_qso_log(READQSO_MAKEDUPE);
-  if (makedupe_main_overflow_count != 0) {
-    console->printf(
-      "MAKEDUPE MAIN fallback: database full; %lu additional unique QSOs "
-      "not stored (capacity=%d)\n",
-      (unsigned long)makedupe_main_overflow_count,
-      get_dupechk_nmaxqso());
+  close_qso_log_readonly(&makedupe_rebuild_file);
+  if (!open_qso_log_readonly(&makedupe_rebuild_file)) {
+    console->println("MAKEDUPE incremental: cannot open QSO log for reading");
+    makedupe_diag_finish();
+    return;
   }
+
+  makedupe_rebuild.active = true;
+  makedupe_rebuild.waiting_subcpu_finish = false;
+  makedupe_rebuild.pos = 0;
+  makedupe_rebuild.count = 0;
+  makedupe_rebuild.len = QSO_RECORD_SIZE;
+  makedupe_rebuild.started_ms = millis();
+  makedupe_rebuild.next_record_ms = makedupe_rebuild.started_ms;
+
+  if (dupechk->dupechk_at == 1) begin_makedupe_subcpu(plogw->mask);
+  console->printf("MAKEDUPE incremental started record_size=%d union_size=%u\n",
+                  makedupe_rebuild.len,
+                  (unsigned int)sizeof(union qso_union_tag));
+}
+
+void process_pending_makedupe_rebuild()
+{
+  if (!makedupe_rebuild.active) {
+    if (!pending_makedupe_rebuild) return;
+    start_incremental_makedupe_rebuild();
+  }
+
+  if (makedupe_rebuild.waiting_subcpu_finish) {
+    if (!poll_finish_makedupe_subcpu()) return;
+    finish_incremental_makedupe_rebuild();
+    return;
+  }
+
+  // Process at most one QSO-file record per loop pass.  The previous v4
+  // processed as many records as fit in a 4 ms slice.  In SUBCPU mode that
+  // can burst several dupeb packets back-to-back and overrun the receiver,
+  // producing reproducibly low QSO/multiplier totals.
+  //
+  // Keep a small inter-record pacing interval without delay(): loop() remains
+  // responsive to keyboard/USB/CAT while the rebuild proceeds in background.
+  const uint32_t now = millis();
+  if ((int32_t)(now - makedupe_rebuild.next_record_ms) < 0) {
+    if (dupechk->dupechk_at == 1 && f_mux_transport)
+      mux_transport.recv_pkt();
+    return;
+  }
+
+  // Drain one pending SUBCPU response before transmitting the next record.
+  if (dupechk->dupechk_at == 1 && f_mux_transport)
+    mux_transport.recv_pkt();
+
+  union qso_union_tag qso_read;
+
+  // QSO.TXT is a stream of fixed 256-byte records.  Do not use
+  // sizeof(union qso_union_tag) here: the union also contains all1[257]
+  // as a NUL-padding view, so sizeof(union qso_union_tag) is 257 bytes.
+  // Reading/advancing by 257 shifts the record boundary by one byte per
+  // record and makes almost every valid QSO look like a non-Q record.
+  //
+  // Use a separate read-only File handle as well.  The rebuild runs in
+  // loop() now, so seeking the live qsologf cursor would interfere with a
+  // QSO appended while the rebuild is still in progress.
+  int ret = read_qso_log_record(&makedupe_rebuild_file, &qso_read);
+  if (ret != makedupe_rebuild.len) {
+    close_qso_log_readonly(&makedupe_rebuild_file);
+    if (dupechk->dupechk_at == 1) {
+      start_finish_makedupe_subcpu();
+      makedupe_rebuild.waiting_subcpu_finish = true;
+    } else {
+      finish_incremental_makedupe_rebuild();
+    }
+    return;
+  }
+
+  makedupe_diag_records++;
+  makedupe_rebuild.pos += makedupe_rebuild.len;
+  // 4 ms is deliberately conservative: a typical dupeb frame is several
+  // dozen bytes at 115200 bps.  Unlike delay(4), this does not block loop().
+  makedupe_rebuild.next_record_ms = millis() + 4;
+
+  if (qso_read.entry.type[0] != 'Q') {
+    makedupe_diag_nonq++;
+    return;
+  }
+
+  makedupe_diag_qrecords++;
+  reformat_qso_entry(&qso_read);
+  makedupe_qso_entry(&qso_read);
+  makedupe_rebuild.count++;
+
+  if ((makedupe_rebuild.count % 50) == 0) {
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "MAKEDUPE\nProcessing...\nQSO %d",
+             makedupe_rebuild.count);
+    upd_display_info_flash(dp->lcdbuf);
+  }
+
+  // Drain an accepted-QSO notification promptly.
+  if (dupechk->dupechk_at == 1 && f_mux_transport)
+    mux_transport.recv_pkt();
 }
 
 void list_qso_backup_files() {

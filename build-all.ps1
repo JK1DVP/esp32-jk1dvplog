@@ -71,6 +71,37 @@ function Copy-FileSafe {
 }
 
 
+function New-Crc32Manifest {
+    param(
+        [string]$DestDir
+    )
+
+    $ManifestScript = Join-Path $RootDir "make_crc32_manifest.py"
+    $Manifest = Join-Path $DestDir "CRC32SUMS.txt"
+
+    if (-not (Test-Path -LiteralPath $ManifestScript -PathType Leaf)) {
+        Die "CRC32 manifest helper not found: $ManifestScript"
+    }
+
+    $Python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $Python) {
+        $Python = Get-Command python3 -ErrorAction SilentlyContinue
+    }
+    if (-not $Python) {
+        Die "Python was not found in PATH"
+    }
+
+    Write-Host ""
+    Write-Host "--- Generating CRC32 manifest ---"
+
+    Invoke-Checked $Python.Source @(
+        $ManifestScript,
+        $DestDir,
+        $Manifest
+    )
+}
+
+
 function Copy-ExtBinaries {
     param(
         [string]$BuildDir,
@@ -213,6 +244,8 @@ function Build-Set {
         (Join-Path $MainBuild "partition_table\partition-table.bin") `
         (Join-Path $DestDir "partition-table.bin")
 
+    New-Crc32Manifest $DestDir
+
     Write-Host ""
     Write-Host "HW$HwVer / $ModelDir completed."
 }
@@ -271,6 +304,7 @@ Write-Host "  binaries/mini/subcpu/app0.bin"
 Write-Host "  binaries/mini/subcpu/bootload.bin"
 Write-Host "  binaries/mini/subcpu/partitio.bin"
 Write-Host "  binaries/mini/subcpu/spiffs.bin"
+Write-Host "  binaries/mini/CRC32SUMS.txt"
 
 Write-Host ""
 Write-Host "HW3 / Wide:"
@@ -281,3 +315,4 @@ Write-Host "  binaries/Wide/subcpu/app0.bin"
 Write-Host "  binaries/Wide/subcpu/bootload.bin"
 Write-Host "  binaries/Wide/subcpu/partitio.bin"
 Write-Host "  binaries/Wide/subcpu/spiffs.bin"
+Write-Host "  binaries/Wide/CRC32SUMS.txt"

@@ -401,10 +401,9 @@ public:
 	set_tx_to_msg_tx();
 	set_rx_in_sending_msg();
 	
-	set_rttymemory_string(radio, 3, plogw->rtty_msg[2] + 2);  // set rtty memory on rig
-	// and send it on the air
-	delay(200);
-	send_rtty_memory(radio, 3);
+	set_rttymemory_string(radio, 3, plogw->rtty_msg[2] + 2);  // set/queue RTTY message
+	// Local Baudot/FSK for every rig; CW:0/1/2 select GPIO and
+	// CW:3/4 select DTR/RTS through the common keying path.
 	sequence_stat(Sending_Msg);	  
 	break;
       }

@@ -458,6 +458,18 @@ void send_tail_civ(struct radio *radio) {
 }
 
 
+// Per-rig RTTY settings.  Negative values preserve the old behaviour.
+int rig_fsk_port(const struct rig *r) {
+  if (!r) return 0;
+  return (r->fskport >= 0 && r->fskport <= 4) ? r->fskport : r->cwport;
+}
+
+bool rig_rtty_invert(const struct rig *r) {
+  if (r && (r->rtty_polarity == 0 || r->rtty_polarity == 1))
+    return r->rtty_polarity != 0;
+  return USBRTTYgetInvert();
+}
+
 // ptt control
 void set_ptt_rig(struct radio *radio, int on) {
   if (radio && radio->rig_spec &&
@@ -466,15 +478,24 @@ void set_ptt_rig(struct radio *radio, int on) {
     return; // receiver only
   }
 
-  // set hardware PTT1 or 2
-  switch (radio->rig_idx) {
-  case 0: // MIC1 PTT ON
-    ptt_switch(0,on);break;
-  case 1: // MIC2 PTT ON
-    ptt_switch(1,on);break;
+  // Hardware MIC/PTT always follows the RADIO slot:
+  // Radio0 -> PTT1, Radio1 -> PTT2, Radio2 -> PTT3.
+  // This is independent of the rig PTT: setting.
+  if (radio->rig_idx >= 0 && radio->rig_idx <= 2)
+    ptt_switch(radio->rig_idx, on);
+
+  // PTT: selects only an additional transmit-control method.
+  // 0/1: don't care (no additional control)
+  // 2: CAT/CI-V PTT
+  // 3: USB DTR
+  // 4: USB RTS
+  if (radio->rig_spec->pttmethod == 3 || radio->rig_spec->pttmethod == 4) {
+    usb_keying_request((uint8_t)radio->rig_spec->pttmethod, on != 0);
   }
-  
+
+  if (radio->rig_spec->pttmethod == 2) {
   switch (radio->rig_spec->cat_type) {
+
   case CAT_TYPE_CIV:  // icom ci-v
     send_head_civ(radio);
     add_civ_buf((byte)0x1c);  //
@@ -526,6 +547,7 @@ void set_ptt_rig(struct radio *radio, int on) {
   }
 
   }
+  } // PTT:2 CAT/CI-V
 
   // if CW mode  also key on / off
   if (radio->modetype == LOG_MODETYPE_CW) {
@@ -1300,6 +1322,145 @@ void send_rit_freq_civ(struct radio *radio, int freq) {
   }
 }
 
+
+
+// CW S&P XIT support.  Keep this deliberately limited to rig families for
+// which DVPlogger has a CAT/CI-V path capable of setting TX clarifier/XIT.
+bool xit_control_supported(struct radio *radio) {
+  if (radio == NULL || radio->rig_spec == NULL) return false;
+
+  const int cat_type = radio->rig_spec->cat_type;
+  const int rig_type = radio->rig_spec->rig_type;
+
+  // Select XIT capability by rig family/type, while keeping a CAT protocol
+  // guard so a mismatched profile cannot send unsupported commands.
+  switch (rig_type) {
+  case RIG_TYPE_ICOM_IC705:
+  case RIG_TYPE_ICOM_IC7300:
+    return cat_type == CAT_TYPE_CIV;
+
+  case RIG_TYPE_YAESU:
+    return cat_type == CAT_TYPE_YAESU_NEW ||
+           cat_type == CAT_TYPE_YAESU_OLD;
+
+  case RIG_TYPE_ELECRAFT_KX:
+    return cat_type == CAT_TYPE_ELECRAFT_KX;
+
+  default:
+    return false;
+  }
+}
+
+void set_xit_control(struct radio *radio, bool on) {
+  if (!xit_control_supported(radio)) return;
+  switch (radio->rig_spec->cat_type) {
+  case CAT_TYPE_CIV:
+    send_rit_setting(radio, 0, on ? 1 : 0);
+    break;
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD: {
+    char buf[24];
+    // CF MAIN, CLAR setting: RX CLAR=0, TX CLAR=on/off.
+    sprintf(buf, "CF0000%c000;", on ? '1' : '0');
+    send_cat_cmd(radio, buf);
+    break;
+  }
+  case CAT_TYPE_ELECRAFT_KX:
+    send_cat_cmd(radio, on ? "XT1;" : "XT0;");
+    break;
+  default:
+    break;
+  }
+}
+
+void set_xit_offset_hz(struct radio *radio, int offset_hz) {
+  if (!xit_control_supported(radio)) return;
+  if (offset_hz > 9999) offset_hz = 9999;
+  if (offset_hz < -9999) offset_hz = -9999;
+  switch (radio->rig_spec->cat_type) {
+  case CAT_TYPE_CIV:
+    // Existing helper uses DVPlogger's 10-Hz frequency unit.
+    send_rit_freq_civ(radio, offset_hz / FREQ_UNIT);
+    break;
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD: {
+    char buf[24];
+    sprintf(buf, "CF001%c%04d;", offset_hz >= 0 ? '+' : '-', abs(offset_hz));
+    send_cat_cmd(radio, buf);
+    break;
+  }
+  case CAT_TYPE_ELECRAFT_KX: {
+    // KX3/K3-family RO command sets the shared RIT/XIT offset in 10-Hz units.
+    char buf[20];
+    int v = offset_hz / 10;
+    sprintf(buf, "RO%+04d;", v);
+    send_cat_cmd(radio, buf);
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+// Yaesu TX CLAR has an important UI side effect on FTX-1 (and can on other
+// recent Yaesu rigs): while TX CLAR is enabled the main tuning dial is used
+// for CLAR adjustment.  Therefore XITON only *arms* Yaesu XIT while receiving.
+// The TX CLAR bit is asserted just before an automatic CW message and cleared
+// again when that message finishes.
+static bool xit_yaesu_transient(const struct radio *radio) {
+  if (radio == NULL || radio->rig_spec == NULL) return false;
+  return radio->rig_spec->cat_type == CAT_TYPE_YAESU_NEW ||
+         radio->rig_spec->cat_type == CAT_TYPE_YAESU_OLD;
+}
+
+static volatile int xit_cw_finish_pending_radio = -1;
+
+void apply_xit_for_operating_mode(struct radio *radio) {
+  if (!xit_control_supported(radio)) return;
+  if (radio->xit_enabled && radio->cq[radio->modetype] == LOG_SandP) {
+    set_xit_offset_hz(radio, radio->xit_offset_hz);
+    if (xit_yaesu_transient(radio)) {
+      // Keep the Yaesu tuning dial as a VFO dial while receiving.
+      set_xit_control(radio, false);
+    } else {
+      set_xit_control(radio, true);
+    }
+  } else {
+    // CQ must always be transmitted at zero offset, irrespective of XITON.
+    set_xit_control(radio, false);
+    set_xit_offset_hz(radio, 0);
+  }
+}
+
+bool prepare_xit_for_cw_message(struct radio *radio) {
+  if (!xit_control_supported(radio) || !radio->xit_enabled ||
+      radio->cq[radio->modetype] != LOG_SandP) return false;
+
+  set_xit_offset_hz(radio, radio->xit_offset_hz);
+  if (xit_yaesu_transient(radio)) {
+    set_xit_control(radio, true);
+    return true; // caller should give CAT a short head start before keying
+  }
+  return false;
+}
+
+void request_finish_xit_cw_message(struct radio *radio) {
+  if (radio == NULL || !xit_yaesu_transient(radio)) return;
+  xit_cw_finish_pending_radio = radio->rig_idx;
+}
+
+void service_xit_cw_message() {
+  int idx = xit_cw_finish_pending_radio;
+  if (idx < 0 || idx >= N_RADIO) return;
+  xit_cw_finish_pending_radio = -1;
+
+  struct radio *radio = &radio_list[idx];
+  if (!xit_control_supported(radio) || !xit_yaesu_transient(radio)) return;
+  // Leave the stored CLAR frequency alone; only release TX CLAR so the main
+  // dial immediately goes back to normal VFO tuning.
+  set_xit_control(radio, false);
+}
+
 void send_freq_set_civ(struct radio *radio, unsigned int freq) {
 
 
@@ -1732,6 +1893,7 @@ void send_ptt_query_civ(struct radio *radio) {
   case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
     // Do nothing; TX/RX status is obtained from the periodic IF response.
+    return;
   case CAT_TYPE_NOCAT:
       return;
   }
@@ -2496,7 +2658,15 @@ void get_cat(struct radio *radio) {
       break;
       //    }
       }
-    case 28: // FT-991 FTDX10
+    case 30: // FTX-1: IF + 5-byte P1 + 9-byte frequency + ...
+      if (radio->rig_spec->cat_type!=CAT_TYPE_YAESU_NEW) return;
+      freq = 0;
+      for (int i = 0; i < 9-(FREQ_UNIT==10 ? 1 : 0 ); i++) { // FREQ_UNIT=10
+	freq *= 10;
+	freq += radio->cmdbuf[i + 7] - '0';
+      }
+      break;
+    case 28: // FT-991 FTDX10: IF + 3-byte P1 + 9-byte frequency + ...
       if (radio->rig_spec->cat_type!=CAT_TYPE_YAESU_NEW) return;
       freq = 0;
       for (int i = 0; i < 9-(FREQ_UNIT==10 ? 1 : 0 ); i++) { // FREQ_UNIT=10
@@ -3580,6 +3750,24 @@ void receive_civport(struct radio *radio) {
     while (uxQueueMessagesWaiting(xQueueCATUSBRx)){
       ret = xQueueReceive(xQueueCATUSBRx, &catmsg, 0);
       if (ret==pdTRUE) {
+        if (verbose & VERBOSE_USB) {
+          static uint32_t bind_civ_rx_seq = 0;
+          ++bind_civ_rx_seq;
+          console->printf(
+            "[USBBIND] RX_CONSUME seq=%lu path=CIV radio=%d spec=%d name=%s "
+            "cat_type=%d civport=%d size=%d data=",
+            (unsigned long)bind_civ_rx_seq, radio->rig_idx, radio->rig_spec_idx,
+            radio->rig_spec->name ? radio->rig_spec->name : "(null)",
+            radio->rig_spec->cat_type, radio->rig_spec->civport_num, catmsg.size);
+          const int bind_dump_n = catmsg.size < 16 ? catmsg.size : 16;
+          for (int bi = 0; bi < bind_dump_n; ++bi) {
+            const uint8_t bc = (uint8_t)catmsg.buf[bi];
+            if (bc >= 0x20 && bc <= 0x7e) console->print((char)bc);
+            else console->printf("\\x%02X", bc);
+          }
+          if (catmsg.size > bind_dump_n) console->print("...");
+          console->println();
+        }
 	
 	if (verbose &1)
 	  console->printf("xQueueReceive() : CATUSBRx ret = %d size =%d\n", ret,catmsg.size);
@@ -4358,29 +4546,47 @@ int check_rig_conflict(int rig_idx,struct rig *rig_spec)
   return -1; // no conflict
 }
 
+// Release the serial resource belonging to the rig currently linked to radio.
+// Keep this separate from select_rig() so a rig_spec can be edited without
+// overwriting the old port information before it is released.
+static void release_rig_serial_resource(struct radio *radio) {
+  if (radio == NULL || radio->rig_spec == NULL) return;
+
+  if (radio->rig_spec->civport != NULL) {
+    if (radio->rig_spec->civport_num == 3) {
+      release_port_serial(radio);
+    }
+    else if (radio->rig_spec->civport_num == 2) {
+      // CI-V port may be shared. Release it only when this is the last user.
+      if (count_usage_civport(radio->rig_spec->civport_num) == 1) {
+        release_port_serial(radio);
+      }
+    }
+  }
+}
+
 // set radio->rig_spec from radio->rig_spec_idx
 void select_rig(struct radio *radio) {
+  console->printf(
+    "[USBBIND] SELECT_BEFORE radio=%d target_spec=%d old_name=%s "
+    "old_civport=%d old_cat_type=%d qmx_ready=%d txq=%u rxq=%u r=%d w=%d\n",
+    radio ? radio->rig_idx : -1,
+    radio ? radio->rig_spec_idx : -1,
+    (radio && radio->rig_spec && radio->rig_spec->name) ? radio->rig_spec->name : "(null)",
+    (radio && radio->rig_spec) ? radio->rig_spec->civport_num : -99,
+    (radio && radio->rig_spec) ? radio->rig_spec->cat_type : -99,
+    usb_cat_ready_for_rig_type(CAT_TYPE_QMX) ? 1 : 0,
+    xQueueCATUSBTx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx) : 0U,
+    xQueueCATUSBRx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBRx) : 0U,
+    radio ? radio->r_ptr : -1, radio ? radio->w_ptr : -1);
+
   if (!plogw->f_console_emu) {
     plogw->ostream->print("select_rig() spec:");
     plogw->ostream->println(radio->rig_spec_idx);
   }
 
-  // before changing rig, release Serail resource
-  if (radio->rig_spec!=NULL) {
-    if (radio->rig_spec->civport!=NULL) {
-      if (radio->rig_spec->civport_num==3) {
-	release_port_serial(radio);
-      }
-      else if (radio->rig_spec->civport_num==2) {
-	// civ port check other ratio is using
-	if (count_usage_civport(radio->rig_spec->civport_num)==1) {
-	  // only this port is using
-	  // --> release the serial 
-	  release_port_serial(radio);
-	}
-      }
-    }
-  }
+  // before changing rig, release Serial resource
+  release_rig_serial_resource(radio);
   console_to_hardwareserial();
   
   // link the rig_spec to the radio structure
@@ -4390,6 +4596,18 @@ void select_rig(struct radio *radio) {
 
   // set serial port characteristics
   config_rig_serialport(radio);
+
+  console->printf(
+    "[USBBIND] SELECT_AFTER radio=%d spec=%d name=%s "
+    "civport=%d cat_type=%d qmx_ready=%d txq=%u rxq=%u r=%d w=%d\n",
+    radio->rig_idx, radio->rig_spec_idx,
+    (radio->rig_spec && radio->rig_spec->name) ? radio->rig_spec->name : "(null)",
+    radio->rig_spec ? radio->rig_spec->civport_num : -99,
+    radio->rig_spec ? radio->rig_spec->cat_type : -99,
+    usb_cat_ready_for_rig_type(CAT_TYPE_QMX) ? 1 : 0,
+    xQueueCATUSBTx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx) : 0U,
+    xQueueCATUSBRx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBRx) : 0U,
+    radio->r_ptr, radio->w_ptr);
 
   /*
    * Do not carry CAT requests from the previously selected USB rig into a
@@ -4406,19 +4624,75 @@ void select_rig(struct radio *radio) {
     ats_mini_bw_last_cmd_ms[radio->rig_idx] = 0;
   }
 
+  console->printf(
+    "SELECT_RIG_USB_DIAG rig_idx=%d spec=%d name=%s civport=%d cat_type=%d "
+    "qmx_const=%d ats_const=%d qmx_ready=%d txq=%u rxq=%u\n",
+    radio->rig_idx, radio->rig_spec_idx,
+    radio->rig_spec->name ? radio->rig_spec->name : "(null)",
+    radio->rig_spec->civport_num,
+    radio->rig_spec->cat_type,
+    CAT_TYPE_QMX, CAT_TYPE_ATS_MINI,
+    usb_cat_ready_for_rig_type(CAT_TYPE_QMX) ? 1 : 0,
+    xQueueCATUSBTx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx) : 0U,
+    xQueueCATUSBRx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBRx) : 0U);
+
   if (radio->rig_spec->civport_num == -1 &&
       (radio->rig_spec->cat_type == CAT_TYPE_QMX ||
-       radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI) &&
-      xQueueCATUSBTx != NULL) {
+       radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI)) {
+    /*
+     * USB CAT uses one shared RX/TX transport.  When the physical USB rig is
+     * changed before select_rig(), bytes from the new device can already have
+     * been queued/parsing under the old protocol (e.g. QMX ASCII while the
+     * radio is still IC-705/CI-V).  Do not carry that partial RX session into
+     * the newly selected protocol.
+     */
     struct catmsg_t stale = {};
-    unsigned int cleared = 0;
-    while (xQueueReceive(xQueueCATUSBTx, &stale, 0) == pdTRUE) {
-      ++cleared;
+    unsigned int tx_cleared = 0;
+    unsigned int rx_cleared = 0;
+
+    if (xQueueCATUSBTx != NULL) {
+      while (xQueueReceive(xQueueCATUSBTx, &stale, 0) == pdTRUE) {
+        ++tx_cleared;
+      }
     }
-    if (verbose & VERBOSE_USB) console->printf("QMX CAT TX queue reset cleared=%u waiting=%u free=%u\n",
-                    cleared,
-                    (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx),
-                    (unsigned int)uxQueueSpacesAvailable(xQueueCATUSBTx));
+    if (xQueueCATUSBRx != NULL) {
+      while (xQueueReceive(xQueueCATUSBRx, &stale, 0) == pdTRUE) {
+        ++rx_cleared;
+      }
+    }
+
+    // Discard bytes already copied into this radio's old-protocol RX state.
+    radio->r_ptr = 0;
+    radio->w_ptr = 0;
+    clear_civ(radio);
+
+    console->printf(
+      "USB CAT protocol switch reset rig=%d type=%d tx=%u rx=%u\n",
+      radio->rig_idx, radio->rig_spec->cat_type,
+      tx_cleared, rx_cleared);
+
+    /*
+     * QMX select_rig forced IF restart temporarily disabled.
+     * Normal periodic CAT polling should establish the first fresh
+     * transaction after the protocol/parser state has been reset.
+     *
+     * Keep this block for easy A/B testing if the old recovery workaround
+     * proves necessary again.
+     */
+#if 0
+    if (radio->rig_spec->cat_type == CAT_TYPE_QMX &&
+        usb_cat_ready_for_rig_type(CAT_TYPE_QMX) &&
+        xQueueCATUSBTx != NULL) {
+      struct catmsg_t startup = {};
+      memcpy(startup.buf, "IF;", 3);
+      startup.size = 3;
+      const BaseType_t qret = xQueueSend(xQueueCATUSBTx, &startup, 0);
+      console->printf(
+        "QMX CAT select_rig restart qret=%d waiting=%u cmd=IF;\n",
+        (int)qret,
+        (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx));
+    }
+#endif
   }
   
   radio->f_civ_response_expected = 0;
@@ -4518,7 +4792,7 @@ void init_rigspec() {
   strcpy(rig_spec[2].name , "FT-991A");
   rig_spec[2].cat_type = CAT_TYPE_YAESU_NEW;  // cat
   rig_spec[2].civaddr = 0;
-  rig_spec[2].civport_num=-1; // USB
+  rig_spec[2].civport_num=3; // default serial; set P:-1 for USB CAT
   rig_spec[2].civport_reversed=0; // normal
   rig_spec[2].civport_baud = 38400;      
   rig_spec[2].cwport = 2;  // test
@@ -4771,6 +5045,72 @@ void init_rigspec() {
   rig_spec[20].transverter_freq[0][0] = 0;
   rig_spec[20].band_mask = ~(BAND_MASK_HF | BAND_MASK_WARC);
 
+  // Additional editable RIG slots. These are normal rig_spec[] entries;
+  // they can be changed from the Web RIG Settings page and saved to rigs.txt.
+  strcpy(rig_spec[21].name , "IC-705-USB");
+  rig_spec[21].cat_type = CAT_TYPE_CIV;
+  rig_spec[21].civaddr = 0xa4;
+  rig_spec[21].civport_num = -1; // USB
+  rig_spec[21].civport_reversed = 0;
+  rig_spec[21].civport_baud = 115200;
+  rig_spec[21].cwport = 3; // USB DTR: CW/RTTY keying for IC-705 USB
+  rig_spec[21].rig_type = RIG_TYPE_ICOM_IC705;
+  rig_spec[21].pttmethod = 2;
+  rig_spec[21].transverter_freq[0][0] = 0;
+  rig_spec[21].band_mask =
+    ~(BAND_MASK_2400 | BAND_MASK_1200 | BAND_MASK_HF | BAND_MASK_50 |
+      BAND_MASK_144 | BAND_MASK_430 | BAND_MASK_WARC);
+
+  // FTX-1.  Transport is selected by P: just like the other rigs:
+  // P:-1 = USB CAT (CP2105 Enhanced port), P:0..4 = normal serial port.
+  strcpy(rig_spec[22].name , "FTX-1");
+  rig_spec[22].cat_type = CAT_TYPE_YAESU_NEW;
+  rig_spec[22].civaddr = 0;
+  rig_spec[22].civport_num = 3; // default serial; set P:-1 for USB CAT
+  rig_spec[22].civport_reversed = 0;
+  rig_spec[22].civport_baud = 38400;
+  rig_spec[22].cwport = 1;
+  rig_spec[22].rig_type = RIG_TYPE_YAESU;
+  rig_spec[22].pttmethod = 2;
+  rig_spec[22].transverter_freq[0][0] = 0;
+  rig_spec[22].band_mask = ~(0b1111111 | BAND_MASK_WARC);
+
+  strcpy(rig_spec[23].name , "QMX-SER");
+  rig_spec[23].cat_type = CAT_TYPE_KENWOOD;
+  rig_spec[23].civaddr = 0;
+  rig_spec[23].civport_num = 3; // TTL-SER
+  rig_spec[23].civport_reversed = 0;
+  rig_spec[23].civport_baud = 38400;
+  rig_spec[23].cwport = 1;
+  rig_spec[23].rig_type = 3;
+  rig_spec[23].pttmethod = 2;
+  rig_spec[23].transverter_freq[0][0] = 0;
+  rig_spec[23].band_mask = 0x0000;
+
+  strcpy(rig_spec[24].name , "IC-7300-USB");
+  rig_spec[24].cat_type = CAT_TYPE_CIV;
+  rig_spec[24].civaddr = 0x94;
+  rig_spec[24].civport_num = -1; // USB
+  rig_spec[24].civport_reversed = 0;
+  rig_spec[24].civport_baud = 115200;
+  rig_spec[24].cwport = 2;
+  rig_spec[24].rig_type = RIG_TYPE_ICOM_IC7300;
+  rig_spec[24].pttmethod = 2;
+  rig_spec[24].transverter_freq[0][0] = 0;
+  rig_spec[24].band_mask = ~(0b1111111 | BAND_MASK_WARC);
+
+  strcpy(rig_spec[25].name , "TS-590G-USB");
+  rig_spec[25].cat_type = CAT_TYPE_KENWOOD;
+  rig_spec[25].civaddr = 0;
+  rig_spec[25].civport_num = -1; // USB
+  rig_spec[25].civport_reversed = 0;
+  rig_spec[25].civport_baud = 115200;
+  rig_spec[25].cwport = 1;
+  rig_spec[25].rig_type = 3;
+  rig_spec[25].pttmethod = 2;
+  rig_spec[25].transverter_freq[0][0] = 0;
+  rig_spec[25].band_mask = 0x0000;
+
 }
 
 
@@ -4778,11 +5118,13 @@ void init_rig() {
   /// setting up rigs
   // clear transverter_setting for all rigs.
 
-  // cwport 0: LED --> IO2 Not connected to keying in revA-C  boards 24/7/28 1: CW_KEY1 --> KEY1 2:CW_KEY2 --> KEY2
+  // cwport 0: LED, 1: KEY1, 2: KEY2, 3: USB CDC DTR, 4: USB CDC RTS
   for (int j = 0; j < N_RIG; j++) {
     rig_spec[j].band_mask = 0x0;
     rig_spec[j].civport=NULL;
     *rig_spec[j].name='\0';
+    rig_spec[j].fskport = -1;
+    rig_spec[j].rtty_polarity = -1;
     
     for (int i = 0; i < NMAX_TRANSVERTER; i++) {
       rig_spec[j].transverter_enable[i] = 0;
@@ -4832,6 +5174,8 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
   rig_spec->civaddr = 0;
   rig_spec->civport_baud = 0;
   rig_spec->civport_reversed = false;
+  rig_spec->fskport = -1;
+  rig_spec->rtty_polarity = -1;
   rig_spec->pttmethod = 0;
   memset(rig_spec->transverter_freq, 0, sizeof(rig_spec->transverter_freq));
   char *saveptr1, *saveptr2;  
@@ -4847,10 +5191,16 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
       console->println("CW: process");      
       // CW port
       n=atoi(p+3);
-      if (n>=0 && n<=3) {
+      if (n>=0 && n<=4) {
 	rig_spec->cwport=n;
 	console->print("rig_spec cwport =");console->println(	rig_spec->cwport);
       }
+    } else if (strncmp(p,"FSK:",4)==0) {
+      n=atoi(p+4);
+      if (n>=0 && n<=4) rig_spec->fskport=n;
+    } else if (strncmp(p,"RP:",3)==0) {
+      n=atoi(p+3);
+      if (n>=0 && n<=1) rig_spec->rtty_polarity=n;
     } else if (strncmp(p,"B:",2)==0) {
       console->println("B: baudrate");            
       // baudrate
@@ -4907,13 +5257,13 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
 	rig_spec->civport_reversed=n;
       }
     } else if (strncmp(p,"PTT:",4)==0) {
-      // ptt method
+      // Additional PTT method:
+      // 0/1 don't care, 2 CAT/CI-V, 3 USB DTR, 4 USB RTS.
       n=atoi(p+4);
-      if (n>=0 && n<=3) {
+      if (n>=0 && n<=4) {
 	rig_spec->pttmethod=n;
-	//	console->print("PTT;");console->println(	rig_spec->pttmethod);
       }
-      
+
     } else if (strncmp(p,"BM:",3)==0) {
       console->print("BM token=");
       console->println(p);
@@ -4945,6 +5295,74 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
 
 }
 
+// Apply an edited rig specification atomically.  The new specification is
+// parsed into a temporary copy first, so the currently active serial/CAT
+// resources can be released using the OLD rig_spec before the global entry is
+// replaced.  LCD and Web editors both use this path.
+bool update_rig_spec(int rig_index, const char *s, char *errbuf, size_t errbuf_size)
+{
+  if (errbuf != NULL && errbuf_size > 0) errbuf[0] = '\0';
+
+  if (rig_index < 0 || rig_index >= N_RIG || s == NULL) {
+    if (errbuf != NULL && errbuf_size > 0) {
+      strlcpy(errbuf, "Invalid RIG index/specification", errbuf_size);
+    }
+    return false;
+  }
+
+  // Preserve the existing parser semantics for omitted fields by starting
+  // from the current entry, but do not commit anything until validation has
+  // completed.
+  struct rig new_spec = rig_spec[rig_index];
+  set_rig_spec_from_str_rig(&new_spec, s);
+
+  // A changed NAME must remain unique.  Rig-name lookup intentionally keeps
+  // its existing prefix-match behavior; only an exact (case-insensitive)
+  // duplicate NAME is rejected here.
+  if (strcasecmp(new_spec.name, rig_spec[rig_index].name) != 0) {
+    for (int i = 0; i < N_RIG; ++i) {
+      if (i == rig_index) continue;
+      if (strcasecmp(new_spec.name, rig_spec[i].name) == 0) {
+        if (errbuf != NULL && errbuf_size > 0) {
+          snprintf(errbuf, errbuf_size, "Duplicate rig name: %s", new_spec.name);
+        }
+        console->print("RIGSPEC update rejected: duplicate NAME=");
+        console->println(new_spec.name);
+        return false;
+      }
+    }
+  }
+
+  bool used_by_radio[N_RADIO] = {};
+  for (int i = 0; i < N_RADIO; ++i) {
+    used_by_radio[i] = (radio_list[i].rig_spec_idx == rig_index);
+  }
+
+  // Release using the OLD rig_spec.  Clear each link after releasing it so
+  // shared CI-V usage counting remains correct while walking the radios.
+  for (int i = 0; i < N_RADIO; ++i) {
+    if (!used_by_radio[i]) continue;
+    release_rig_serial_resource(&radio_list[i]);
+    radio_list[i].rig_spec = NULL;
+  }
+  console_to_hardwareserial();
+
+  // Never carry the old runtime Stream pointer into the replacement entry.
+  // config_rig_serialport() will establish the proper pointer again below.
+  new_spec.civport = NULL;
+  rig_spec[rig_index] = new_spec;
+
+  // Re-select every radio using this rig_spec.  This refreshes rig_name,
+  // rig_spec_str, band_mask, CAT/serial settings, PTT state, and USB rig state
+  // identically for LCD and Web edits.
+  for (int i = 0; i < N_RADIO; ++i) {
+    if (!used_by_radio[i]) continue;
+    select_rig(&radio_list[i]);
+  }
+
+  return true;
+}
+
 // set rig_spec characteristics from string
 void set_rig_spec_from_str(struct radio *radio,char *s)
 {
@@ -4966,6 +5384,12 @@ void print_rig_spec_str(int rig_idx,char *buf) // reverse set rig_spec_string fr
   }
   p=&rig_spec[rig_idx];
   sprintf(buf1,"CW:%d,", p->cwport);  strcat(buf,buf1);
+  if (p->fskport >= 0 && p->fskport <= 4) {
+    sprintf(buf1,"FSK:%d,", p->fskport); strcat(buf,buf1);
+  }
+  if (p->rtty_polarity == 0 || p->rtty_polarity == 1) {
+    sprintf(buf1,"RP:%d,", p->rtty_polarity); strcat(buf,buf1);
+  }
   sprintf(buf1,"TP:%d_%d,", p->cat_type,p->rig_type);  strcat(buf,buf1);
   sprintf(buf1,"P:%d,", p->civport_num);  strcat(buf,buf1);
   if (p->civaddr!=0) {
@@ -5125,6 +5549,8 @@ void load_rigs(const char *fn)
 }
 
 void init_radio(struct radio *radio, const char *rig_name) {
+  radio->xit_enabled = false;
+  radio->xit_offset_hz = 0;
   radio->f_freqchange_program=0;
   radio->f_romaji=0;
   radio->antenna=-1; // not connected -1
@@ -5755,6 +6181,8 @@ int unique_num_radio(int i) {
 
 // RTTYメッセージ送信前後　などのPTT制御を行う。
 void Control_TX_process() {
+  // Also service deferred Yaesu TX-CLAR release requests from the CW ticker.
+  service_xit_cw_message();
   struct radio *radio;
   radio = &radio_list[so2r.tx()];
   switch (f_transmission) {
@@ -5762,6 +6190,21 @@ void Control_TX_process() {
       break;
     case 1:  // force transmission
       set_ptt_rig(radio, 1);
+      // For USB FSK RTTY, measure the MARK lead from here, after the PTT ON
+      // command has actually been issued.  Previously the lead started in
+      // the 1-ms CW ticker before this main-loop PTT operation, so a busy
+      // main loop could clip the beginning of the RTTY message.
+      if (f_rtty_usb_lead_pending) {
+        const uint8_t fskport = (uint8_t)rig_fsk_port(radio->rig_spec);
+        if (!radio->f_tone_keying && (fskport == 3 || fskport == 4)) {
+          int lead_ms = rtty_ptt_lead_ms;
+          if (lead_ms < 0) lead_ms = 0;
+          if (lead_ms > 2000) lead_ms = 2000;
+          usb_rtty_begin(fskport, (uint32_t)lead_ms, rig_rtty_invert(radio->rig_spec));
+          cw_count_ms = lead_ms;
+        }
+        f_rtty_usb_lead_pending = false;
+      }
       if (!plogw->f_console_emu) {
         plogw->ostream->println("PTT ON TX=");
         plogw->ostream->println(so2r.tx());

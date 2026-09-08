@@ -184,6 +184,16 @@ public:
                 return true;
         }
 
+        /*
+         * Hubs use a synthetic address whose low bits are a hub number, not
+         * the upstream port number.  Drivers that need exact physical
+         * parent/port matching can override this.
+         */
+        virtual bool HUBPORTOK(uint8_t parent __attribute__((unused)),
+                               uint8_t port __attribute__((unused))) {
+                return false;
+        }
+
 };
 
 /* USB Setup Packet Structure   */
@@ -284,6 +294,7 @@ public:
         uint8_t DefaultAddressing(uint8_t parent, uint8_t port, bool lowspeed);
         uint8_t Configuring(uint8_t parent, uint8_t port, bool lowspeed);
         uint8_t ReleaseDevice(uint8_t addr);
+        uint8_t ReleaseDeviceAtPort(uint8_t parent, uint8_t port);
 
         uint8_t ctrlReq(uint8_t addr, uint8_t ep, uint8_t bmReqType, uint8_t bRequest, uint8_t wValLo, uint8_t wValHi,
                 uint16_t wInd, uint16_t total, uint16_t nbytes, uint8_t* dataptr, USBReadParser *p);

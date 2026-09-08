@@ -10,12 +10,16 @@
 #define CP2105_VID                 0x10C4
 #define CP2105_PID_FACTORY         0xEA70
 #define CP2105_PID_WINDOWS         0xEA7A
+#define CP2102_PID                 0xEA60
 
 #define CP210X_REQTYPE_OUT         0x41
+#define CP210X_REQTYPE_IN          0xC1
 #define CP210X_IFC_ENABLE          0x00
 #define CP210X_SET_LINE_CTL        0x03
 #define CP210X_SET_MHS             0x07
 #define CP210X_PURGE               0x12
+#define CP210X_SET_FLOW            0x13
+#define CP210X_GET_FLOW            0x14
 #define CP210X_SET_BAUDRATE        0x1E
 
 #define CP210X_UART_ENABLE         0x0001
@@ -44,10 +48,14 @@ public:
 
         bool VIDPIDOK(uint16_t vid, uint16_t pid) {
                 return vid == CP2105_VID &&
-                       (pid == CP2105_PID_FACTORY || pid == CP2105_PID_WINDOWS);
+                       (pid == CP2105_PID_FACTORY || pid == CP2105_PID_WINDOWS ||
+                        pid == CP2102_PID);
         }
 
         bool isReady() const { return ready; }
+        bool isSinglePort() const { return singlePort; }
+        uint16_t GetVid() const { return deviceVid; }
+        uint16_t GetPid() const { return devicePid; }
         bool portReady(uint8_t port) const;
         uint8_t GetAddress() { return bAddress; }
 
@@ -58,7 +66,12 @@ public:
         uint8_t EnablePort(uint8_t port, bool enable);
         uint8_t SetBaudRate(uint8_t port, uint32_t baudrate);
         uint8_t SetLineControl(uint8_t port, uint16_t lineCtl);
+        uint8_t SetModemControl(uint8_t port, uint16_t state, uint16_t mask);
         uint8_t SetModemHandshake(uint8_t port, bool dtr, bool rts);
+        uint8_t SetDTR(uint8_t port, bool on);
+        uint8_t SetRTS(uint8_t port, bool on);
+        uint8_t GetFlow(uint8_t port, uint8_t data[16]);
+        uint8_t SetFlow(uint8_t port, const uint8_t data[16]);
         uint8_t Purge(uint8_t port);
 
         uint8_t RcvData(uint8_t port, uint16_t *bytes_rcvd, uint8_t *data);
@@ -86,6 +99,9 @@ private:
         uint8_t bConfNum;
         uint8_t bNumEP;
         bool ready;
+        bool singlePort;
+        uint16_t deviceVid;
+        uint16_t devicePid;
         bool ifaceFound[PORTS];
         uint8_t ifaceNumber[PORTS];
         uint32_t configuredBaud[PORTS];
@@ -95,6 +111,8 @@ private:
         uint8_t controlOut(uint8_t port, uint8_t request,
                            uint16_t value, uint16_t length = 0,
                            uint8_t *data = NULL);
+        uint8_t controlIn(uint8_t port, uint8_t request,
+                          uint16_t value, uint16_t length, uint8_t *data);
         void resetState();
 };
 
