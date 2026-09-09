@@ -20,15 +20,70 @@
  */
 
 #include <Arduino.h>
+#include <stdarg.h>
 #include <ch9350if.h>
 #include <ch9350if_hidkeys.h>
 #include "mux_transport.h"
+
+#ifndef DVP_CH9350_KEY_DIAG
+#define DVP_CH9350_KEY_DIAG 1
+#endif
+
+static bool g_ch9350_diag_enabled = false; // default OFF for normal operation
+
+void set_ch9350_diag_enabled(bool enabled)
+{
+  g_ch9350_diag_enabled = enabled;
+}
+
+bool ch9350_diag_enabled()
+{
+  return g_ch9350_diag_enabled;
+}
+
+static void ch9350_diag_mux(const char *fmt, ...)
+{
+#if DVP_CH9350_KEY_DIAG
+  if (!g_ch9350_diag_enabled || !f_mux_transport) return;
+  char body[180];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(body, sizeof(body), fmt, ap);
+  va_end(ap);
+
+  char pkt[196];
+  snprintf(pkt, sizeof(pkt), "kbdiag:%s", body);
+  mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                         (unsigned char *)pkt, strlen(pkt));
+#endif
+}
+
+static bool ch9350_diag_key(uint8_t hid_code)
+{
+  return hid_code == 0x36 || hid_code == 0x37 || // band down/up
+         hid_code == 0x10 ||                     // M (Alt-M)
+         hid_code == 0xe0 || hid_code == 0xe1 ||
+         hid_code == 0xe2 || hid_code == 0xe3 ||
+         hid_code == 0xe4 || hid_code == 0xe5 ||
+         hid_code == 0xe6 || hid_code == 0xe7;
+}
+
 
 class _ch9350 : public ch9350if {
   uint8_t led_state = 0;
 public:
   _ch9350(uint8_t rst) : ch9350if(rst) {}
   void key_event(uint8_t hid_code, bool on) {
+#if DVP_CH9350_KEY_DIAG
+    if (g_ch9350_diag_enabled && ch9350_diag_key(hid_code)) {
+      Serial.printf("CH9350_EVT t=%lu hid=0x%02X on=%u mux=%u\n",
+                    (unsigned long)millis(), (unsigned int)hid_code,
+                    on ? 1U : 0U, f_mux_transport ? 1U : 0U);
+      ch9350_diag_mux("EVT t=%lu hid=0x%02X on=%u",
+                       (unsigned long)millis(), (unsigned int)hid_code,
+                       on ? 1U : 0U);
+    }
+#endif
     if (f_mux_transport) {
       // Include a monotonically increasing sequence number so that the main
       // board can detect a lost key transition.  Losing only an Alt/Ctrl/Shift
@@ -38,6 +93,16 @@ public:
       tmp_buf[0] = hid_code;
       tmp_buf[1] = on;
       tmp_buf[2] = key_event_seq++;
+#if DVP_CH9350_KEY_DIAG
+      if (g_ch9350_diag_enabled && ch9350_diag_key(hid_code)) {
+        Serial.printf("CH9350_TX  t=%lu seq=%u hid=0x%02X on=%u\n",
+                      (unsigned long)millis(), (unsigned int)tmp_buf[2],
+                      (unsigned int)hid_code, on ? 1U : 0U);
+        ch9350_diag_mux("TX t=%lu seq=%u hid=0x%02X on=%u",
+                         (unsigned long)millis(), (unsigned int)tmp_buf[2],
+                         (unsigned int)hid_code, on ? 1U : 0U);
+      }
+#endif
       mux_transport.send_pkt(MUX_PORT_USB_KEYBOARD1_EXT,
                              MUX_PORT_USB_KEYBOARD1_MAIN, tmp_buf, 3);
     } else {
@@ -63,9 +128,34 @@ public:
     }
   }
   void dataframe(uint8_t* data, uint8_t data_length) {
-    if (!f_mux_transport) {    
+#if DVP_CH9350_KEY_DIAG
+    if (g_ch9350_diag_enabled) {
+    Serial.printf("CH9350_RAW t=%lu len=%u", (unsigned long)millis(),
+                  (unsigned int)data_length);
+    bool interesting = false;
+    for (uint8_t i = 0; i < data_length; i++) {
+      Serial.printf(" %02X", (unsigned int)data[i]);
+      const uint8_t b = data[i];
+      if (b == 0x36 || b == 0x37 || b == 0x10 ||
+          (b >= 0xe0 && b <= 0xe7)) interesting = true;
+    }
+    Serial.println();
+
+    if (interesting && f_mux_transport) {
+      char raw[150];
+      int n = snprintf(raw, sizeof(raw), "RAW t=%lu len=%u",
+                       (unsigned long)millis(), (unsigned int)data_length);
+      for (uint8_t i = 0; i < data_length && n < (int)sizeof(raw) - 4; i++) {
+        n += snprintf(raw + n, sizeof(raw) - n, " %02X",
+                      (unsigned int)data[i]);
+      }
+      ch9350_diag_mux("%s", raw);
+    }
+    }
+#endif
+    if (!f_mux_transport) {
       for(uint8_t i = 0; i < data_length; i++)
-	dump_byte(data[i]);    
+	dump_byte(data[i]);
     }
   }
 };

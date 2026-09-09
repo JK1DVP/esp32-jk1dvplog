@@ -96,6 +96,13 @@ extern SoftwareSerial Serial3;
 long freq;
 char opmode[8];
 
+// Forward declaration: the mode-pending helper near the top of this file
+// snapshots the confirmed band state before the implementation below.
+static void save_band_last_state(struct radio *radio);
+static void restore_rig_antenna_for_bandid(struct radio *radio, int bandid);
+static int yaesu_scope_span_for_mode(int mode);
+static void set_yaesu_scope_span_center(struct radio *radio, int mode);
+
 // ATS Mini absolute-mode emulation -----------------------------------------
 // Stock ATS Mini Ad hoc protocol exposes only M/m (next/previous mode).
 // The receiver's mode order is FM -> LSB -> USB -> AM.
@@ -403,21 +410,32 @@ void set_frequency_rig_radio(unsigned int freq, struct radio *radio) {
   if (!radio->enabled) return;
 
   radio->f_freqchange_program = 1;
-  radio->freqchange_program_guard = 500;
-  // check manual radio
-  if (radio->rig_spec->cat_type == 3) {
-    // manual rig
+  radio->freq_target = freq;
+  radio->bandid_target = freq2bandid(freq);
+  radio->freqchange_program_guard = 0;
+
+  // For a program-originated cross-band QSY, select the target band's antenna
+  // before sending the frequency command.  FTX-1 band switching otherwise
+  // leaves ANT restoration visibly later than the QSY.
+  if (radio->bandid_target > 0 &&
+      radio->bandid_target != radio->bandid) {
+    restore_rig_antenna_for_bandid(radio, radio->bandid_target);
+  }
+
+  // Manual rig is the sole exception: there is no CAT report to confirm state.
+  if (radio->rig_spec->cat_type == CAT_TYPE_NOCAT) {
     set_frequency(freq, radio);
-    radio->f_freqchange_pending=0;
-    radio->f_freqchange_program=0;
+    radio->f_freqchange_pending = 0;
+    radio->f_freqchange_program = 0;
+    radio->bandid_target = 0;
     return;
   }
 
-  send_freq_set_civ(radio, freq);  // send to civ port
+  send_freq_set_civ(radio, freq);
   radio->freqchange_timer =
       (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI) ? 800 : 200;
+  radio->freqchange_retry = 0;
   radio->f_freqchange_pending = 1;
-  radio->freq_target = freq;
 }
 
 
@@ -715,15 +733,16 @@ enum {
   YAESU_QUERY_PA,
   YAESU_QUERY_PC,
   YAESU_QUERY_ID,
+  YAESU_QUERY_RIGANT,
   YAESU_QUERY_COUNT
 };
 
 static const char *const yaesu_query_commands[YAESU_QUERY_COUNT] = {
-  "IF;", "SM0;", "TX;", "RA0;", "PA0;", "PC;", "ID;"
+  "IF;", "SM0;", "TX;", "RA0;", "PA0;", "PC;", "ID;", "EX030704;"
 };
 
 static const char *const yaesu_query_prefixes[YAESU_QUERY_COUNT] = {
-  "IF", "SM", "TX", "RA", "PA", "PC", "ID"
+  "IF", "SM", "TX", "RA", "PA", "PC", "ID", "EX"
 };
 
 static bool is_yaesu_ascii_radio(const struct radio *radio)
@@ -1127,25 +1146,25 @@ int freq_width_mode(char *opmode)
 
 void set_power(struct radio *radio, int power)  // power value is in W
 {
+  if (radio == nullptr || radio->rig_spec == nullptr) return;
+
   char buf[40];
   int max_power=50;
 
   switch(radio->rig_spec->cat_type) {
-  
   case CAT_TYPE_CIV:
-    // icom	    
     switch (radio->rig_spec->rig_type) {
-    case RIG_TYPE_ICOM_IC7300:  // IC-7300  ... almost the same as IC705 except for preamp gain in 50MHz
+    case RIG_TYPE_ICOM_IC7300:
       max_power=50;
       break;
-    case RIG_TYPE_ICOM_IC705:  // IC-705
+    case RIG_TYPE_ICOM_IC705:
       max_power=10;
       break;
-    case RIG_TYPE_ICOM_IC9700:  // IC-9700
+    case RIG_TYPE_ICOM_IC9700:
       max_power=50;
       break;
     }
-    power=power*255/max_power; // normalize power
+    power=power*255/max_power;
     if (power>255) power=255;
     if (power<0) power=0;
     send_head_civ(radio);
@@ -1155,8 +1174,30 @@ void set_power(struct radio *radio, int power)  // power value is in W
     add_civ_buf((byte)dec2bcd(power%100));
     send_tail_civ(radio);
     break;
+
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:
+    if (radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1) {
+      // FTX-1 PC has an extra path selector:
+      //   PC1xxx; = Field head (5..10 W)
+      //   PC2xxx; = SPA-1      (5..100 W)
+      // Prefer the path learned from the latest PC; response.  If it is not
+      // known yet, infer SPA-1 only when the requested power exceeds 10 W.
+      int source = radio->power_source;
+      if (source != 1 && source != 2) source = (power > 10) ? 2 : 1;
+      int limit = (source == 1) ? 10 : 100;
+      if (power < 5) power = 5;
+      if (power > limit) power = limit;
+      sprintf(buf, "PC%d%03d;", source, power);
+      send_cat_cmd(radio, buf);
+    } else {
+      if (power < 5) power = 5;
+      if (power > 100) power = 100;
+      sprintf(buf, "PC%03d;", power);
+      send_cat_cmd(radio, buf);
+    }
+    break;
+
   case CAT_TYPE_KENWOOD:
   case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
@@ -1166,81 +1207,273 @@ void set_power(struct radio *radio, int power)  // power value is in W
   }
 }
 
+bool rig_antenna_supported(const struct radio *radio)
+{
+  return radio != nullptr && radio->rig_spec != nullptr &&
+         radio->rig_spec->cat_type == CAT_TYPE_YAESU_NEW &&
+         radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1;
+}
+
+void send_rig_antenna_query(struct radio *radio)
+{
+  if (!radio || !radio->enabled || !rig_antenna_supported(radio)) return;
+  // FTX-1: OPERATION SETTING -> OPTION -> HF ANT SELECT.
+  send_cat_cmd(radio, "EX030704;");
+}
+
+void set_rig_antenna(struct radio *radio, int ant, bool remember)
+{
+  if (!rig_antenna_supported(radio) || (ant != 1 && ant != 2)) return;
+
+  char buf[20];
+  sprintf(buf, "EX030704%d;", ant - 1); // 0=ANT1, 1=ANT2
+  send_cat_cmd(radio, buf);
+
+  radio->rig_antenna = ant;
+  if (remember && radio->bandid >= 1 && radio->bandid <= N_BAND)
+    radio->rig_antenna_band[radio->bandid] = ant;
+}
+
+static void restore_rig_antenna_for_bandid(struct radio *radio, int bandid)
+{
+  if (!rig_antenna_supported(radio)) return;
+  if (bandid < 1 || bandid > N_BAND) return;
+
+  const int ant = radio->rig_antenna_band[bandid];
+  if (ant == 1 || ant == 2) {
+    if (verbose & 16)
+      console->printf("RIGANT_PREQSY radio=%d target_b=%d ant=%d\n",
+                      radio->rig_idx, bandid, ant);
+    set_rig_antenna(radio, ant, false);
+  }
+}
+
+void restore_rig_antenna_for_band(struct radio *radio)
+{
+  if (!radio) return;
+  restore_rig_antenna_for_bandid(radio, radio->bandid);
+}
+
+
+bool yaesu_scope_supported(const struct radio *radio)
+{
+  if (radio == nullptr || radio->rig_spec == nullptr) return false;
+  return radio->rig_spec->cat_type == CAT_TYPE_YAESU_NEW ||
+         radio->rig_spec->cat_type == CAT_TYPE_YAESU_OLD;
+}
+
+static void yaesu_scope_set_mode_code(struct radio *radio, char code)
+{
+  if (!yaesu_scope_supported(radio)) return;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "SS06%c0000;", code);
+  send_cat_cmd(radio, buf);
+}
+
+static void yaesu_scope_set_span_code(struct radio *radio, int span_code)
+{
+  if (!yaesu_scope_supported(radio)) return;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "SS05%d0000;", span_code);
+  send_cat_cmd(radio, buf);
+}
+
+void send_yaesu_scope_level_query(struct radio *radio)
+{
+  if (!radio || !radio->enabled || !yaesu_scope_supported(radio)) return;
+  send_cat_cmd(radio, "SS04;");
+}
+
+void set_yaesu_scope_level_x2(struct radio *radio, int level_x2, bool remember)
+{
+  if (!yaesu_scope_supported(radio)) return;
+  if (level_x2 < -60) level_x2 = -60;
+  if (level_x2 > 60) level_x2 = 60;
+
+  const int abs_x2 = level_x2 < 0 ? -level_x2 : level_x2;
+  const int whole = abs_x2 / 2;
+  const int half = (abs_x2 & 1) ? 5 : 0;
+  char buf[20];
+  snprintf(buf, sizeof(buf), "SS04%c%02d.%d;",
+           level_x2 < 0 ? '-' : '+', whole, half);
+  send_cat_cmd(radio, buf);
+
+  radio->scope_level_x2 = level_x2;
+  if (remember && radio->bandid >= 1 && radio->bandid <= N_BAND)
+    radio->scope_level_band_x2[radio->bandid] = level_x2;
+}
+
+static int yaesu_preamp_selector(const struct radio *radio)
+{
+  if (!radio || !radio->rig_spec) return 0;
+  if (radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1) {
+    if (radio->bandid == 8) return 1; // VHF
+    if (radio->bandid == 9) return 2; // UHF
+  }
+  return 0; // HF/50 MHz
+}
+
+void set_yaesu_preamp(struct radio *radio, int preamp, bool remember)
+{
+  if (!yaesu_scope_supported(radio)) return;
+
+  const int selector = yaesu_preamp_selector(radio);
+  const int max_value = selector == 0 ? 2 : 1;
+  if (preamp < 0) preamp = 0;
+  if (preamp > max_value) preamp = max_value;
+
+  char buf[12];
+  snprintf(buf, sizeof(buf), "PA%d%d;", selector, preamp);
+  send_cat_cmd(radio, buf);
+  radio->preamp = preamp;
+
+  if (remember && radio->bandid >= 1 && radio->bandid <= N_BAND)
+    radio->preamp_band[radio->bandid] = preamp;
+}
+
+void restore_yaesu_band_settings(struct radio *radio)
+{
+  if (!yaesu_scope_supported(radio)) return;
+  if (radio->bandid < 1 || radio->bandid > N_BAND) return;
+
+  const int level_x2 = radio->scope_level_band_x2[radio->bandid];
+  if (level_x2 >= -60 && level_x2 <= 60)
+    set_yaesu_scope_level_x2(radio, level_x2, false);
+
+  const int preamp = radio->preamp_band[radio->bandid];
+  if (preamp >= 0 && preamp <= 2)
+    set_yaesu_preamp(radio, preamp, false);
+}
+
+void service_yaesu_scope()
+{
+  const uint32_t now = millis();
+  for (int i = 0; i < N_RADIO; ++i) {
+    struct radio *radio = &radio_list[i];
+    if (!radio->scope_cursor_restore_pending) continue;
+    if ((int32_t)(now - radio->scope_cursor_restore_due_ms) < 0) continue;
+
+    radio->scope_cursor_restore_pending = 0;
+    // W/F CURSOR (NORMAL): code 7 on both FTDX10 and FTX-1.
+    yaesu_scope_set_mode_code(radio, '7');
+  }
+}
+
 void set_scope() {
-  int mode;
-  struct radio *radio;
-  radio = so2r.radio_selected();
-  mode = rig_modenum(radio->opmode);
-  set_scope_mode(radio,mode);
+  struct radio *radio = so2r.radio_selected();
+  if (!radio) return;
+  set_scope_mode(radio, rig_modenum(radio->opmode));
+}
+
+void recenter_scope()
+{
+  struct radio *radio = so2r.radio_selected();
+  if (!radio || !radio->enabled || !radio->rig_spec) return;
+
+  // There is no CAT field on either FTDX10 or FTX-1 for the numeric
+  // CURSOR display-window position.  SS02 controls only marker visibility.
+  //
+  // FTDX10 keeps the newly centered window when returning CENTER->CURSOR,
+  // so retain the established sequence through set_scope_mode().
+  //
+  // FTX-1 restores its previous CURSOR window when SS0670000 is sent.
+  // Therefore an explicit Alt-' recenter must remain in CENTER mode; this
+  // is the only CAT operation that guarantees the receive frequency is at
+  // the center of the scope.
+  if (yaesu_scope_supported(radio) &&
+      radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1) {
+    set_yaesu_scope_span_center(radio, rig_modenum(radio->opmode));
+    return;
+  }
+
+  set_scope_mode(radio, rig_modenum(radio->opmode));
+}
+
+static int yaesu_scope_span_for_mode(int mode)
+{
+  // SS P2=5 span codes: 3=10 kHz, 5=50 kHz, 6=100 kHz.
+  // Preserve the established DVPlogger mapping:
+  // CW/RTTY/CW-R/RTTY-R -> 10 kHz, SSB/AM/DV -> 50 kHz, FM/WFM -> 500 kHz.
+  switch (mode) {
+    case 3: case 7: case 4: case 8: return 3;
+    case 0: case 1: case 2: case 0x17: return 5;
+    case 5: case 6: return 8;
+    default: return 0;
+  }
+}
+
+static void set_yaesu_scope_span_center(struct radio *radio, int mode)
+{
+  if (!yaesu_scope_supported(radio)) return;
+  const int span = yaesu_scope_span_for_mode(mode);
+  if (span == 0) return;
+
+  // FTX-1 explicit recenter: set the appropriate span, then remain in
+  // W/F CENTER.  Returning to CURSOR would restore the old CURSOR window.
+  radio->scope_cursor_restore_pending = 0;
+  yaesu_scope_set_mode_code(radio, '4');
+  yaesu_scope_set_span_code(radio, span);
+
+  if (radio->bandid >= 1 && radio->bandid <= N_BAND) {
+    const int saved = radio->scope_level_band_x2[radio->bandid];
+    if (saved >= -60 && saved <= 60)
+      set_yaesu_scope_level_x2(radio, saved, false);
+  }
+
+  if (verbose & 16)
+    console->printf("SCOPE_CENTER radio=%d mode=%d span=%d b=%d\\n",
+                    radio->rig_idx, mode, span, radio->bandid);
 }
 
 void set_scope_mode(struct radio *radio,int mode) {
   int span;
-  char buf[40];
-
   if (radio == nullptr || !radio->enabled || radio->rig_spec == nullptr) return;
 
   span=0;
   switch (radio->rig_spec->cat_type) {
-  case CAT_TYPE_CIV:  // Icom CI-V
+  case CAT_TYPE_CIV:
       switch (mode) {
-        case 3:       // CW
-        case 7:       // CW-R
-        case 4:       // RTTY
-        case 8:       // RTTY-R
-          span = 0x10000;    // 10 kHz
-          break;
-        case 0:       // LSB
-        case 1:       // USB
-          span = 0x25000;    // 25 kHz
-          break;
-        case 2:       // AM
-        case 0x17:    // DV
-          span = 0x50000;    // 50 kHz
-          break;
-        case 5:       // FM
-        case 6:       // WFM
-          span = 0x0250000;  // 250 kHz
-          break;
-        default:
-          return;             // do not send an invalid/zero span
+        case 3: case 7: case 4: case 8: span = 0x10000; break;
+        case 0: case 1: span = 0x25000; break;
+        case 2: case 0x17: span = 0x50000; break;
+        case 5: case 6: span = 0x0250000; break;
+        default: return;
       }
-
       send_head_civ(radio);
       add_civ_buf((byte)0x27);
       add_civ_buf((byte)0x15);
       add_civ_buf((byte)0x00);
       for (int i = 0; i < 5; i++) {
         add_civ_buf((byte)(span & 0xff));
-        span = span >> 8;
+        span >>= 8;
       }
       send_tail_civ(radio);
       break;
 
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:
-      switch (mode) {
-        case 3:       // CW
-        case 7:       // CW-R
-        case 4:       // RTTY
-        case 8:       // RTTY-R
-          span = 3;   // 10 kHz
-          break;
-        case 0:       // LSB
-        case 1:       // USB
-        case 2:       // AM
-        case 0x17:    // DV (future Yaesu support)
-          span = 5;   // 50 kHz
-          break;
-        case 5:       // FM
-        case 6:       // WFM
-          span = 6;   // 100 kHz
-          break;
-        default:
-          return;
+      span = yaesu_scope_span_for_mode(mode);
+      if (span == 0) return;
+
+      // Common Yaesu scope sequence:
+      // CENTER(NORMAL) -> SPAN -> CURSOR(NORMAL).
+      yaesu_scope_set_mode_code(radio, '4');
+      yaesu_scope_set_span_code(radio, span);
+
+      if (radio->bandid >= 1 && radio->bandid <= N_BAND) {
+        const int saved = radio->scope_level_band_x2[radio->bandid];
+        if (saved >= -60 && saved <= 60)
+          set_yaesu_scope_level_x2(radio, saved, false);
       }
-      sprintf(buf, "SS0640000;SS05%d0000;SS0670000;", span);
-      send_cat_cmd(radio, buf);
+
+      // FTX-1 needs a short settling interval before switching back to
+      // CURSOR; FTDX10 can take the common final command immediately.
+      if (radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1) {
+        radio->scope_cursor_restore_pending = 1;
+        radio->scope_cursor_restore_due_ms = millis() + 120;
+      } else {
+        yaesu_scope_set_mode_code(radio, '7');
+      }
       break;
 
   default:
@@ -1326,6 +1559,212 @@ void send_rit_freq_civ(struct radio *radio, int freq) {
 
 // CW S&P XIT support.  Keep this deliberately limited to rig families for
 // which DVPlogger has a CAT/CI-V path capable of setting TX clarifier/XIT.
+
+bool rit_control_supported(struct radio *radio) {
+  if (radio == NULL || radio->rig_spec == NULL) return false;
+  switch (radio->rig_spec->cat_type) {
+    case CAT_TYPE_CIV:
+    case CAT_TYPE_YAESU_NEW:
+    case CAT_TYPE_YAESU_OLD:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool xit_effectively_on(const struct radio *radio) {
+  return radio && radio->xit_enabled &&
+         radio->cq[radio->modetype] == LOG_SandP;
+}
+
+static void load_selected_rit_xit_offset(struct radio *radio) {
+  if (!radio) return;
+  int offset = 0;
+  if (radio->rit_xit_adjust_target == 1 && radio->rit_enabled)
+    offset = radio->rit_offset_hz;
+  else if (radio->rit_xit_adjust_target == 2 && radio->xit_enabled)
+    offset = radio->xit_offset_hz;
+  set_xit_offset_hz(radio, offset);
+}
+
+void select_rit_adjust_target(struct radio *radio) {
+  if (!radio) return;
+  radio->rit_xit_adjust_target = 1;
+  load_selected_rit_xit_offset(radio);
+}
+
+void select_xit_adjust_target(struct radio *radio) {
+  if (!radio) return;
+  radio->rit_xit_adjust_target = 2;
+  load_selected_rit_xit_offset(radio);
+}
+
+void adjust_rit_xit_offset(struct radio *radio, int delta_hz) {
+  if (!radio) return;
+  if (radio->rit_xit_adjust_target == 1 && radio->rit_enabled) {
+    radio->rit_offset_hz += delta_hz;
+    if (radio->rit_offset_hz > 9999) radio->rit_offset_hz = 9999;
+    if (radio->rit_offset_hz < -9999) radio->rit_offset_hz = -9999;
+    set_xit_offset_hz(radio, radio->rit_offset_hz);
+  } else if (radio->rit_xit_adjust_target == 2 && radio->xit_enabled) {
+    radio->xit_offset_hz += delta_hz;
+    if (radio->xit_offset_hz > 9999) radio->xit_offset_hz = 9999;
+    if (radio->xit_offset_hz < -9999) radio->xit_offset_hz = -9999;
+    set_xit_offset_hz(radio, radio->xit_offset_hz);
+  }
+}
+
+void set_rit_control(struct radio *radio, bool on) {
+  if (!rit_control_supported(radio)) return;
+  radio->rit_enabled = on;
+  if (on) {
+    select_rit_adjust_target(radio);
+  } else {
+    radio->rit_offset_hz = 0;
+    if (radio->rit_xit_adjust_target == 1) {
+      set_xit_offset_hz(radio, 0);
+      radio->rit_xit_adjust_target = 0;
+    }
+  }
+
+  // Yaesu and CI-V helpers set RIT and XIT in one operation. Preserve the
+  // independently requested XIT state instead of clobbering it.
+  send_rit_setting(radio, on ? 1 : 0, xit_effectively_on(radio) ? 1 : 0);
+
+  if (verbose & 16)
+    console->printf("RIT radio=%d enabled=%d xit_effective=%d\n",
+                    radio->rig_idx, on ? 1 : 0,
+                    xit_effectively_on(radio) ? 1 : 0);
+}
+
+bool yaesu_rx_control_supported(struct radio *radio) {
+  if (!radio || !radio->rig_spec) return false;
+  return radio->rig_spec->cat_type == CAT_TYPE_YAESU_NEW ||
+         radio->rig_spec->cat_type == CAT_TYPE_YAESU_OLD;
+}
+
+static int yaesu_width_code_for_cycle(struct radio *radio, int cycle) {
+  if (!radio) return -1;
+  const int mode = rig_modenum(radio->opmode);
+
+  // Three useful contest widths. SH uses the same P3 table on FTDX10 and
+  // current FTX-1 for SSB/CW/RTTY-family modes.
+  if (mode == 0 || mode == 1) {          // LSB / USB
+    static const int code[3] = {9, 13, 20}; // 1800 / 2400 / 3000 Hz
+    return code[cycle % 3];
+  }
+  if (mode == 3 || mode == 7 ||          // CW / CW-R
+      mode == 4 || mode == 8) {          // RTTY / RTTY-R
+    static const int code[3] = {10, 13, 17}; // 500 / 1200 / 2400 Hz
+    return code[cycle % 3];
+  }
+  return -1;
+}
+
+static int yaesu_width_hz_for_code(int mode, int code) {
+  if (mode == 0 || mode == 1) {
+    if (code == 9) return 1800;
+    if (code == 13) return 2400;
+    if (code == 20) return 3000;
+  } else {
+    if (code == 10) return 500;
+    if (code == 13) return 1200;
+    if (code == 17) return 2400;
+  }
+  return 0;
+}
+
+
+int cycle_rx_filter(struct radio *radio) {
+  if (!radio || !radio->rig_spec) return -1;
+
+  if (radio->rig_spec->cat_type == CAT_TYPE_CIV) {
+    // Icom operating-mode command carries FIL1/FIL2/FIL3 as its filter byte.
+    // Preserve the current operating mode and only advance the filter.
+    int next = radio->filt;
+    if (next < 1 || next > 3) next = 1;
+    else {
+      next++;
+      if (next > 3) next = 1;
+    }
+
+    send_mode_set_civ_radio(radio->opmode, next, radio);
+    radio->filt = next;
+    save_band_last_state(radio);
+
+    if (verbose & 16)
+      console->printf("F11_FILTER CIV radio=%d mode=%s FIL%d\n",
+                      radio->rig_idx, radio->opmode, next);
+    return next; // Icom: return FIL number, not Hz.
+  }
+
+  return cycle_yaesu_width(radio);
+}
+
+int cycle_rx_agc(struct radio *radio) {
+  if (!radio || !radio->rig_spec) return -1;
+
+  if (radio->rig_spec->cat_type == CAT_TYPE_CIV) {
+    int mode = radio->yaesu_agc_mode;
+    // Icom supports 01 FAST, 02 MID, 03 SLOW. Do not use Yaesu AUTO=4.
+    if (mode < 1 || mode > 3) mode = 0;
+    mode++;
+    if (mode > 3) mode = 1;
+    radio->yaesu_agc_mode = mode;
+
+    send_head_civ(radio);
+    add_civ_buf((byte)0x16);
+    add_civ_buf((byte)0x12);
+    add_civ_buf((byte)mode);
+    send_tail_civ(radio);
+
+    if (verbose & 16)
+      console->printf("F12_AGC CIV radio=%d agc=%d\n",
+                      radio->rig_idx, mode);
+    return mode;
+  }
+
+  return cycle_yaesu_agc(radio);
+}
+
+int cycle_yaesu_width(struct radio *radio) {
+  if (!yaesu_rx_control_supported(radio)) return -1;
+
+  radio->yaesu_width_cycle = (radio->yaesu_width_cycle + 1) % 3;
+  const int code =
+      yaesu_width_code_for_cycle(radio, radio->yaesu_width_cycle);
+  if (code < 0) return -1;
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "SH00%02d;", code);
+  send_cat_cmd(radio, buf);
+
+  const int hz = yaesu_width_hz_for_code(rig_modenum(radio->opmode), code);
+  if (verbose & 16)
+    console->printf("F11_WIDTH radio=%d mode=%s code=%d hz=%d cmd=%s\n",
+                    radio->rig_idx, radio->opmode, code, hz, buf);
+  return hz;
+}
+
+int cycle_yaesu_agc(struct radio *radio) {
+  if (!yaesu_rx_control_supported(radio)) return -1;
+
+  int mode = radio->yaesu_agc_mode;
+  if (mode < 1 || mode > 4) mode = 4;
+  mode++;
+  if (mode > 4) mode = 1;
+  radio->yaesu_agc_mode = mode;
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "GT0%d;", mode);
+  send_cat_cmd(radio, buf);
+
+  if (verbose & 16)
+    console->printf("F12_AGC radio=%d agc=%d cmd=%s\n",
+                    radio->rig_idx, mode, buf);
+  return mode;
+}
+
 bool xit_control_supported(struct radio *radio) {
   if (radio == NULL || radio->rig_spec == NULL) return false;
 
@@ -1340,6 +1779,7 @@ bool xit_control_supported(struct radio *radio) {
     return cat_type == CAT_TYPE_CIV;
 
   case RIG_TYPE_YAESU:
+  case RIG_TYPE_YAESU_FTX1:
     return cat_type == CAT_TYPE_YAESU_NEW ||
            cat_type == CAT_TYPE_YAESU_OLD;
 
@@ -1355,13 +1795,20 @@ void set_xit_control(struct radio *radio, bool on) {
   if (!xit_control_supported(radio)) return;
   switch (radio->rig_spec->cat_type) {
   case CAT_TYPE_CIV:
-    send_rit_setting(radio, 0, on ? 1 : 0);
+    send_rit_setting(radio, radio->rit_enabled ? 1 : 0, on ? 1 : 0);
     break;
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD: {
     char buf[24];
     // CF MAIN, CLAR setting: RX CLAR=0, TX CLAR=on/off.
-    sprintf(buf, "CF0000%c000;", on ? '1' : '0');
+    // FTX-1 and FTDX10 use the same P4=RX / P5=TX CLAR setting.
+    sprintf(buf, "CF000%c%c000;",
+            radio->rit_enabled ? '1' : '0',
+            on ? '1' : '0');
+    if (verbose & 16)
+      console->printf("XIT YAESU radio=%d RXCLAR=%d TXCLAR=%d cmd=%s\n",
+                      radio->rig_idx, radio->rit_enabled ? 1 : 0,
+                      on ? 1 : 0, buf);
     send_cat_cmd(radio, buf);
     break;
   }
@@ -1374,12 +1821,19 @@ void set_xit_control(struct radio *radio, bool on) {
 }
 
 void set_xit_offset_hz(struct radio *radio, int offset_hz) {
-  if (!xit_control_supported(radio)) return;
+  // The RIT/XIT offset register is shared on CI-V rigs.  Do not require XIT
+  // capability here: IC-9700 supports RIT and CI-V command 21 00, even though
+  // it is not in the older xit_control_supported() rig-type whitelist.
+  if (!rit_control_supported(radio) && !xit_control_supported(radio)) return;
   if (offset_hz > 9999) offset_hz = 9999;
   if (offset_hz < -9999) offset_hz = -9999;
   switch (radio->rig_spec->cat_type) {
   case CAT_TYPE_CIV:
-    // Existing helper uses DVPlogger's 10-Hz frequency unit.
+    // send_rit_freq_civ() has a legacy 10-Hz-unit API; convert from the
+    // public Hz value here.  F9/arrow adjustments are 20-Hz steps.
+    if (verbose & 16)
+      console->printf("RIT_OFFSET CIV radio=%d offset_hz=%d\n",
+                      radio->rig_idx, offset_hz);
     send_rit_freq_civ(radio, offset_hz / FREQ_UNIT);
     break;
   case CAT_TYPE_YAESU_NEW:
@@ -1402,15 +1856,13 @@ void set_xit_offset_hz(struct radio *radio, int offset_hz) {
   }
 }
 
-// Yaesu TX CLAR has an important UI side effect on FTX-1 (and can on other
-// recent Yaesu rigs): while TX CLAR is enabled the main tuning dial is used
-// for CLAR adjustment.  Therefore XITON only *arms* Yaesu XIT while receiving.
-// The TX CLAR bit is asserted just before an automatic CW message and cleared
-// again when that message finishes.
+// XITON means that XIT is actually active during S&P.  On current Yaesu
+// rigs this is TX-only CLAR: keep RX CLAR off and TX CLAR on.  Earlier code
+// deliberately made Yaesu TX CLAR transient (CW-message-only), which left
+// FTX-1/FTDX10 showing a programmed CLAR offset with TX CLAR disabled.
 static bool xit_yaesu_transient(const struct radio *radio) {
-  if (radio == NULL || radio->rig_spec == NULL) return false;
-  return radio->rig_spec->cat_type == CAT_TYPE_YAESU_NEW ||
-         radio->rig_spec->cat_type == CAT_TYPE_YAESU_OLD;
+  (void)radio;
+  return false;
 }
 
 static volatile int xit_cw_finish_pending_radio = -1;
@@ -1419,12 +1871,13 @@ void apply_xit_for_operating_mode(struct radio *radio) {
   if (!xit_control_supported(radio)) return;
   if (radio->xit_enabled && radio->cq[radio->modetype] == LOG_SandP) {
     set_xit_offset_hz(radio, radio->xit_offset_hz);
-    if (xit_yaesu_transient(radio)) {
-      // Keep the Yaesu tuning dial as a VFO dial while receiving.
+    // XITON in S&P means active XIT, including Yaesu TX-only CLAR.
+    // xit_yaesu_transient() is now false, so TX CLAR remains enabled until
+    // XITOFF, CQ transition, or another explicit operating-state change.
+    if (xit_yaesu_transient(radio))
       set_xit_control(radio, false);
-    } else {
+    else
       set_xit_control(radio, true);
-    }
   } else {
     // CQ must always be transmitted at zero offset, irrespective of XITON.
     set_xit_control(radio, false);
@@ -1741,6 +2194,84 @@ void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio)
   }
 }
 
+void request_mode_change_radio(const char *opmode, int filnr, struct radio *radio)
+{
+  if (!radio || !radio->enabled || !opmode) return;
+
+  // Manual/NOCAT is the only exception: no CAT reply exists to confirm mode.
+  if (radio->rig_spec && radio->rig_spec->cat_type == CAT_TYPE_NOCAT) {
+    set_mode(opmode, filnr, radio);
+    radio->f_modechange_pending = 0;
+    return;
+  }
+
+  radio->f_modechange_pending = 1;
+  radio->mode_target_modenum = rig_modenum(opmode);
+  radio->mode_target_filt = filnr;
+  strncpy(radio->mode_target_opmode, opmode,
+          sizeof(radio->mode_target_opmode) - 1);
+  radio->mode_target_opmode[sizeof(radio->mode_target_opmode) - 1] = '\0';
+
+  if (verbose & 16) {
+    console->printf(
+        "MODE_TARGET radio=%d actual=%s/%d target=%s/%d filt=%d\n",
+        radio->rig_idx, radio->opmode, rig_modenum(radio->opmode),
+        radio->mode_target_opmode, radio->mode_target_modenum,
+        radio->mode_target_filt);
+  }
+
+  // Do not optimistically alter opmode/modetype.  The rig report commits it.
+  send_mode_set_civ_radio(opmode, filnr, radio);
+}
+
+static void accept_mode_report(const char *opmode, int filnr,
+                               struct radio *radio)
+{
+  if (!radio || !opmode) return;
+
+  const int reported_modenum = rig_modenum(opmode);
+
+  if (!radio->f_modechange_pending) {
+    set_mode(opmode, filnr, radio);
+    return;
+  }
+
+  if (verbose & 16) {
+    console->printf(
+        "MODE_REPORT radio=%d reported=%s/%d target=%s/%d pending=1\n",
+        radio->rig_idx, opmode, reported_modenum,
+        radio->mode_target_opmode, radio->mode_target_modenum);
+  }
+
+  if (reported_modenum != radio->mode_target_modenum) {
+    if (verbose & 16) {
+      console->printf("MODE_REPORT_IGNORED radio=%d reported=%s/%d\n",
+                      radio->rig_idx, opmode, reported_modenum);
+    }
+    return;
+  }
+
+  // Requested mode has been observed from the rig: commit actual state once.
+  set_mode(opmode, filnr, radio);
+  save_band_last_state(radio);
+
+  // Apply scope only after target mode is confirmed by the rig.
+  // This makes Ctrl-Z / Alt-M mode changes consistent with band-change
+  // handling and avoids FTX-1/FTDX10 overwriting the span during mode switch.
+  set_scope_mode(radio, reported_modenum);
+
+  radio->f_modechange_pending = 0;
+  radio->mode_target_modenum = -1;
+  radio->mode_target_filt = 0;
+  radio->mode_target_opmode[0] = '\0';
+
+  if (verbose & 16) {
+    console->printf("MODE_CHANGE_COMPLETED radio=%d actual=%s/%d scope_updated=1\n",
+                    radio->rig_idx, radio->opmode, reported_modenum);
+  }
+}
+
+
 
 void send_mode_set_civ(const char *opmode, int filnr) {
   send_mode_set_civ_radio(opmode, filnr, so2r.radio_selected());
@@ -1942,11 +2473,12 @@ void send_preamp_query_civ(struct radio *radio) {
   type = radio->rig_spec->cat_type;
   switch (type) {
   case CAT_TYPE_YAESU_NEW:
-  case CAT_TYPE_YAESU_OLD:
-
-
-      send_cat_cmd(radio, "PA0;");
+  case CAT_TYPE_YAESU_OLD: {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "PA%d;", yaesu_preamp_selector(radio));
+      send_cat_cmd(radio, buf);
       return;
+  }
   case CAT_TYPE_YAESU_FT817:
   case CAT_TYPE_KENWOOD:
   case CAT_TYPE_QMX:
@@ -2092,55 +2624,84 @@ void send_smeter_query_civ(struct radio *radio) {
 void set_frequency(int freq, struct radio *radio) {
 
   //  if (verbose & 16) plogw->ostream->println("set_frequency()");
-  if ((radio->f_freqchange_pending) && !((plogw->sat) || (radio->rig_spec->cat_type == 3))) {  // not sat and pending
-    if (verbose & 16) plogw->ostream->println("freq_change_pending");
-    // wait until received freq is the same as the target plogw->freq (already changed by the program)
-    if (radio->freq_target == freq) {
-      // frequency set to rig completed
+  if ((radio->f_freqchange_pending) &&
+      !((plogw->sat) || (radio->rig_spec->cat_type == CAT_TYPE_NOCAT))) {
+    if (verbose & 16) {
+      console->printf("freq_pending actual=%u/b%d target=%u/b%d report=%d/b%d timer=%d\n",
+                      radio->freq, radio->bandid,
+                      radio->freq_target, radio->bandid_target,
+                      freq, freq2bandid((unsigned int)freq),
+                      radio->freqchange_timer);
+    }
+
+    if (radio->freq_target == (unsigned int)freq) {
+      const int confirmed_bandid = freq2bandid((unsigned int)freq);
+      if (confirmed_bandid == 0) return;
+
+      radio->freq_prev = radio->freq;
+      radio->freq = (unsigned int)freq;
+      radio->bandid = confirmed_bandid;
+      radio->bandid_prev = confirmed_bandid;
+      radio->bandid_bandmap = confirmed_bandid;
+
       radio->f_freqchange_pending = 0;
       radio->f_freqchange_program = 0;
       radio->freqchange_timer = 0;
       radio->freqchange_retry = 0;
-      radio->freqchange_program_guard = 500;
+      radio->freqchange_program_guard = 0;
       radio->freq_change_count = 0;
       radio->freq_change_candidate = 0;
-      radio->freq = radio->freq_target;
-      radio->freq_prev = radio->freq;  // make the frequency tracking as normal
-      if (verbose & 16) plogw->ostream->println("freq_change_completed");
-      bandmap_disp.f_update = 1;  // request bandmap change
-    } else {
-      if (radio->freqchange_timer == 0) {
-        // timeout
-        radio->freqchange_retry++;
-        if (radio->freqchange_retry < 4) {
-          set_frequency_rig(radio->freq_target);
-        } else {
-          radio->f_freqchange_pending = 0;  // abandon
-	  radio->f_freqchange_program = 0; 
-          radio->freqchange_retry = 0;
-	  if (verbose & 16) plogw->ostream->println("freq_change akirameru");	  
-          return;
-        }
+      radio->bandid_target = 0;
+
+      // RIGANT was already applied before the QSY command.  Band-specific
+      // Yaesu level/preamp and scope are applied only after the rig has
+      // confirmed the new frequency, so the FTX-1's own band-stack recall
+      // cannot immediately overwrite them.
+      restore_yaesu_band_settings(radio);
+
+      int scope_modenum = 0;
+      if (confirmed_bandid >= 1 && confirmed_bandid < N_BAND)
+        scope_modenum = radio->last_modebank[confirmed_bandid];
+      if (scope_modenum < 0)
+        scope_modenum = rig_modenum(radio->opmode);
+      set_scope_mode(radio, scope_modenum);
+
+      if (verbose & 16)
+        console->printf("freq_change_completed actual=%u/b%d\n",
+                        radio->freq, radio->bandid);
+      bandmap_disp.f_update = 1;
+      radio->f_recall_freq_mode_filt = 0;
+      return;
+    }
+
+    // Until target is reported, keep actual freq/bandid as the last rig-confirmed state.
+    if (radio->freqchange_timer == 0) {
+      radio->freqchange_retry++;
+      if (radio->freqchange_retry < 4) {
+        // Retry the same radio; do not use current UI focus.
+        send_freq_set_civ(radio, radio->freq_target);
+        radio->freqchange_timer =
+            (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI) ? 800 : 200;
+      } else {
+        radio->f_freqchange_pending = 0;
+        radio->f_freqchange_program = 0;
+        radio->freqchange_retry = 0;
+        radio->bandid_target = 0;
+        if (verbose & 16) plogw->ostream->println("freq_change akirameru");
       }
     }
+    return;
   } else {
     radio->f_freqchange_pending = 0;  // adhoc
 
-    if (freq != radio->freq) {
-      // A program-originated CAT set may be followed by delayed/stale frequency
-      // reports.  Do not interpret those as a human dial movement.
-      if (!is_manual_rig(radio) &&
-          radio->rig_spec->cat_type != CAT_TYPE_ATS_MINI &&
-          radio->freqchange_program_guard > 0) {
-        radio->freq_change_count = 0;
-        radio->freq_change_candidate = 0;
-        if (verbose & 16) {
-          console->print("set_frequency():ignore guarded freq=");
-          console->println(freq);
-        }
-        return;
-      }
+    // Keep the pre-change state.  A real rig band switch is already in
+    // effect while we are waiting for the second identical CAT frequency
+    // report, so radio->bandid must not be used later as the save location
+    // for the old frequency after it has been updated to the new band.
+    const unsigned int freq_before_change = radio->freq;
+    const int bandid_before_change = radio->bandid;
 
+    if (freq != radio->freq) {
       // Confirm a manual dial movement only when the *same* new frequency is
       // received twice.  The old code merely counted any two different
       // values, so two CAT glitches could force CQ -> S&P.
@@ -2171,10 +2732,20 @@ void set_frequency(int freq, struct radio *radio) {
       radio->freq_change_count = 0;
       radio->freq_change_candidate = 0;
     }
-    // set received frequency
-    radio->freq_prev = radio->freq;
-    radio->freq = freq;
-    radio->bandid = freq2bandid(radio->freq);
+    // Set actual frequency and band atomically from the accepted rig report.
+    const int confirmed_bandid_now = freq2bandid((unsigned int)freq);
+    if (confirmed_bandid_now == 0) return;
+    radio->freq_prev = freq_before_change;
+    radio->freq = (unsigned int)freq;
+    radio->bandid = confirmed_bandid_now;
+    const bool confirmed_cross_band =
+        (radio->bandid > 0 && bandid_before_change > 0 &&
+         radio->bandid != bandid_before_change);
+    if (confirmed_cross_band && (verbose & 16)) {
+      console->printf("set_frequency():confirmed band %d -> %d freq %u -> %u\n",
+                      bandid_before_change, radio->bandid,
+                      freq_before_change, radio->freq);
+    }
     if (radio->bandid != radio->bandid_prev) {
       // band change
       radio->bandid_prev = radio->bandid;
@@ -2198,8 +2769,21 @@ void set_frequency(int freq, struct radio *radio) {
 	//if (radio->cq[radio->modetype] && !radio->f_recall_freq_mode_filt) {
 	if (radio->cq[radio->modetype] && !radio->f_freqchange_program) {
           // frequency change in CQ and non-sat detected
-          // save previous frequency to memorize as cq frequency
-          radio->freqbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype] = radio->freq_prev;
+          // Save the previous CQ frequency in the band it actually came
+          // from.  radio->bandid already points at the newly confirmed band
+          // here; using it used to corrupt the new band's frequency bank.
+          int save_bandid = confirmed_cross_band ? bandid_before_change
+                                                  : radio->bandid;
+          if (save_bandid >= 1 && save_bandid < N_BAND &&
+              freq2bandid(radio->freq_prev) == save_bandid) {
+            radio->freqbank[save_bandid]
+                           [radio->cq[radio->modetype]]
+                           [radio->modetype] = radio->freq_prev;
+          } else if (verbose & 16) {
+            console->printf("freqbank reject oldfreq=%u bank=%d derived=%d\n",
+                            radio->freq_prev, save_bandid,
+                            freq2bandid(radio->freq_prev));
+          }
           radio->cq[radio->modetype] = LOG_SandP;  // change to s&p
         } else {
           // s&p  and frequency(dial) moved situation
@@ -2277,6 +2861,10 @@ void set_mode_nonfil(const char *opmode, struct radio *radio) {
     set_log_rst(radio);  // adjust RST according to the mode
   }
   radio->modetype_prev = radio->modetype;
+  radio->f_modechange_pending = 0;
+  radio->mode_target_modenum = -1;
+  radio->mode_target_filt = 0;
+  radio->mode_target_opmode[0] = '\0';
 }
 
 void set_mode(const char *opmode, byte filt, struct radio *radio) {
@@ -2416,7 +3004,7 @@ The fixed-value fields (space, 0, and 1) are provided for syntactic compatibilit
 
     //   if (radio->rig_idx == 0) {
 
-    set_mode(opmode, filt, radio);
+    accept_mode_report(opmode, filt, radio);
     //    }
     // check tx/rx status
     radio->ptt_stat_prev = radio->ptt_stat;
@@ -2547,7 +3135,7 @@ void get_cat_kenwood(struct radio *radio) {
 
     //   if (radio->rig_idx == 0) {
 
-    set_mode(opmode, filt, radio);
+    accept_mode_report(opmode, filt, radio);
     //    }
     // check tx/rx status
     radio->ptt_stat_prev = radio->ptt_stat;
@@ -2630,6 +3218,15 @@ void get_cat(struct radio *radio) {
   
   if (strncmp(radio->cmdbuf, "IF", 2) == 0) {
     // information
+    // A Yaesu IF frame must be terminated by ';'.  Reject a truncated or
+    // otherwise malformed frame before interpreting any fields.
+    if (len <= 0 || radio->cmdbuf[len - 1] != ';') {
+      if (verbose & VERBOSE_CAT) {
+        console->printf("!Yaesu IF malformed terminator len=%d\n", len);
+      }
+      return;
+    }
+
     // check length
     switch (len) {
     default:
@@ -2662,24 +3259,48 @@ void get_cat(struct radio *radio) {
       if (radio->rig_spec->cat_type!=CAT_TYPE_YAESU_NEW) return;
       freq = 0;
       for (int i = 0; i < 9-(FREQ_UNIT==10 ? 1 : 0 ); i++) { // FREQ_UNIT=10
+        const char c = radio->cmdbuf[i + 7];
+        if (c < '0' || c > '9') {
+          if (verbose & VERBOSE_CAT) {
+            console->printf("!Yaesu IF invalid freq char pos=%d val=0x%02X\n",
+                            i + 7, (unsigned int)(uint8_t)c);
+          }
+          return;
+        }
 	freq *= 10;
-	freq += radio->cmdbuf[i + 7] - '0';
+	freq += c - '0';
       }
       break;
     case 28: // FT-991 FTDX10: IF + 3-byte P1 + 9-byte frequency + ...
       if (radio->rig_spec->cat_type!=CAT_TYPE_YAESU_NEW) return;
       freq = 0;
       for (int i = 0; i < 9-(FREQ_UNIT==10 ? 1 : 0 ); i++) { // FREQ_UNIT=10
+        const char c = radio->cmdbuf[i + 5];
+        if (c < '0' || c > '9') {
+          if (verbose & VERBOSE_CAT) {
+            console->printf("!Yaesu IF invalid freq char pos=%d val=0x%02X\n",
+                            i + 5, (unsigned int)(uint8_t)c);
+          }
+          return;
+        }
 	freq *= 10;
-	freq += radio->cmdbuf[i + 5] - '0';
+	freq += c - '0';
       }
       break;
     case 27: // FT-3000
       if (radio->rig_spec->cat_type!=CAT_TYPE_YAESU_OLD) return;      
       freq = 0;
       for (int i = 0; i < 8-(FREQ_UNIT==10 ? 1 : 0 ); i++) { // FREQ_UNIT=10
+        const char c = radio->cmdbuf[i + 5];
+        if (c < '0' || c > '9') {
+          if (verbose & VERBOSE_CAT) {
+            console->printf("!Yaesu IF invalid freq char pos=%d val=0x%02X\n",
+                            i + 5, (unsigned int)(uint8_t)c);
+          }
+          return;
+        }
 	freq *= 10;
-	freq += radio->cmdbuf[i + 5] - '0';
+	freq += c - '0';
       }
       break;
     }
@@ -2742,7 +3363,7 @@ void get_cat(struct radio *radio) {
     //  }
     // if (radio->rig_idx == 0) {
 
-    set_mode(opmode, filt, radio);
+    accept_mode_report(opmode, filt, radio);
     // }
   } else if (strncmp(radio->cmdbuf, "SM", 2) == 0) {
     // read meter
@@ -2804,18 +3425,64 @@ void get_cat(struct radio *radio) {
     }
   } else if (strncmp(radio->cmdbuf,"PC",2)==0) {
     // power
-    tmp=radio->cmdbuf[2] -'0';
-    tmp=tmp*10+(radio->cmdbuf[3]-'0');
-    tmp=tmp*10+(radio->cmdbuf[4]-'0');
+    if (radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1) {
+      // FTX-1 answer: PC P1 P2P2P2 ; (P1=1 head, P1=2 SPA-1)
+      if ((radio->cmdbuf[2] != '1' && radio->cmdbuf[2] != '2') ||
+          radio->cmdbuf[3] < '0' || radio->cmdbuf[3] > '9' ||
+          radio->cmdbuf[4] < '0' || radio->cmdbuf[4] > '9' ||
+          radio->cmdbuf[5] < '0' || radio->cmdbuf[5] > '9') return;
+      radio->power_source = radio->cmdbuf[2] - '0';
+      tmp = (radio->cmdbuf[3]-'0') * 100 +
+            (radio->cmdbuf[4]-'0') * 10 +
+            (radio->cmdbuf[5]-'0');
+    } else {
+      if (radio->cmdbuf[2] < '0' || radio->cmdbuf[2] > '9' ||
+          radio->cmdbuf[3] < '0' || radio->cmdbuf[3] > '9' ||
+          radio->cmdbuf[4] < '0' || radio->cmdbuf[4] > '9') return;
+      tmp=(radio->cmdbuf[2]-'0')*100 +
+          (radio->cmdbuf[3]-'0')*10 +
+          (radio->cmdbuf[4]-'0');
+    }
     radio->power=tmp;
     if (verbose & VERBOSE_CAT) {
       plogw->ostream->println(radio->cmdbuf);
       plogw->ostream->print("power:");
       plogw->ostream->println(radio->power);
     }
+  } else if (strncmp(radio->cmdbuf, "SS04", 4) == 0) {
+    char tmpbuf[8];
+    memcpy(tmpbuf, radio->cmdbuf + 4, 5);
+    tmpbuf[5] = '\0';
+    const float level = atof(tmpbuf);
+    const int level_x2 =
+        (int)(level * 2.0f + (level >= 0 ? 0.5f : -0.5f));
+    if (level_x2 >= -60 && level_x2 <= 60) {
+      radio->scope_level_x2 = level_x2;
+      if (radio->bandid >= 1 && radio->bandid <= N_BAND)
+        radio->scope_level_band_x2[radio->bandid] = level_x2;
+      if (verbose & VERBOSE_CAT)
+        console->printf("scope level x2=%d band=%d\n",
+                        level_x2, radio->bandid);
+    }
+  } else if (strncmp(radio->cmdbuf, "EX030704", 8) == 0) {
+    // FTX-1 HF ANT SELECT answer: EX0307040; or EX0307041;
+    if (!rig_antenna_supported(radio)) return;
+    const char v = radio->cmdbuf[8];
+    if (v != '0' && v != '1') return;
+    const int ant = (v - '0') + 1;
+    radio->rig_antenna = ant;
+    if (radio->bandid >= 1 && radio->bandid <= N_BAND)
+      radio->rig_antenna_band[radio->bandid] = ant;
+    if (verbose & VERBOSE_CAT) {
+      console->printf("rig antenna: ANT%d band=%d\n", ant, radio->bandid);
+    }
   } else if (strncmp(radio->cmdbuf, "PA", 2) == 0) {
-    // PRE-AMP
-    radio->preamp = radio->cmdbuf[3] - '0';
+    // PRE-AMP / IPO answer: PA P1 P2 ;
+    const char p2 = radio->cmdbuf[3];
+    if (p2 < '0' || p2 > '2') return;
+    radio->preamp = p2 - '0';
+    if (radio->bandid >= 1 && radio->bandid <= N_BAND)
+      radio->preamp_band[radio->bandid] = radio->preamp;
     if (verbose & VERBOSE_CAT) {
       plogw->ostream->print("preamp:");
       plogw->ostream->println(radio->preamp);
@@ -2949,7 +3616,8 @@ void conv_smeter(struct radio *radio) {
       }
       radio->smeter += radio->att * SMETER_UNIT_DBM;
       break;
-    case RIG_TYPE_YAESU:  // yaesu (measured for FTDX10 and FT991A)
+    case RIG_TYPE_YAESU:       // Yaesu (measured for FTDX10 and FT991A)
+    case RIG_TYPE_YAESU_FTX1:  // FTX-1: generic Yaesu path until calibrated
       if (strncmp(radio->rig_spec->rig_identification, "0670", 4) == 0) {
         // FT991A
         if (verbose & VERBOSE_CAT) {
@@ -3158,7 +3826,7 @@ void get_cat_ft817(struct radio *radio) {
     }
     filt = 1;
     radio->filt = filt;
-    set_mode(opmode, filt, radio);
+    accept_mode_report(opmode, filt, radio);
 
     // reset cat status
     radio->cat_status=0;
@@ -3625,7 +4293,7 @@ void get_civ(struct radio *radio) {
     }
     
     // it is rx mode for satellite
-    set_mode(opmode, filt, radio);
+    accept_mode_report(opmode, filt, radio);
     break;
   }
   //
@@ -5070,7 +5738,7 @@ void init_rigspec() {
   rig_spec[22].civport_reversed = 0;
   rig_spec[22].civport_baud = 38400;
   rig_spec[22].cwport = 1;
-  rig_spec[22].rig_type = RIG_TYPE_YAESU;
+  rig_spec[22].rig_type = RIG_TYPE_YAESU_FTX1;
   rig_spec[22].pttmethod = 2;
   rig_spec[22].transverter_freq[0][0] = 0;
   rig_spec[22].band_mask = ~(0b1111111 | BAND_MASK_WARC);
@@ -5280,14 +5948,18 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
 	console->println(rig_spec->band_mask, HEX);
       }
     } else if (strncmp(p,"TP:",3)==0) {
-      // cat_type and rig_type
-      if (strlen(p)>=3+3) {
-	if (isdigit(p[3])) {
-	  rig_spec->cat_type=p[3]-'0';
-	}
-	if (isdigit(p[5])) {
-	  rig_spec->rig_type=p[5]-'0';
-	}
+      // CAT type and rig type.  Historically both were one digit and this
+      // parser read fixed character positions (TP:1_2).  Rig types can now
+      // exceed 9 (for example FTX-1 = 10), so parse both fields as integers.
+      int cat_type = -1;
+      int rig_type = -1;
+      if (sscanf(p + 3, "%d_%d", &cat_type, &rig_type) == 2 &&
+          cat_type >= 0 && rig_type >= 0) {
+        rig_spec->cat_type = cat_type;
+        rig_spec->rig_type = rig_type;
+      } else {
+        console->print("invalid TP token=");
+        console->println(p);
       }
     }
     p=strtok_r(NULL,", ",&saveptr1);
@@ -5549,19 +6221,35 @@ void load_rigs(const char *fn)
 }
 
 void init_radio(struct radio *radio, const char *rig_name) {
+  radio->rit_enabled = false;
+  radio->rit_offset_hz = 0;
+  radio->rit_xit_adjust_target = 0;
   radio->xit_enabled = false;
   radio->xit_offset_hz = 0;
+  radio->yaesu_width_cycle = 0;
+  radio->yaesu_agc_mode = 4; // AUTO; first F12 press selects FAST
   radio->f_freqchange_program=0;
   radio->f_romaji=0;
   radio->antenna=-1; // not connected -1
   radio->f_qsl=0;
   radio->smeter_stat = 0;
   radio->power =0;
-  radio->power_bak =0;  
+  radio->power_bak =0;
+  radio->power_source = 0;
+  radio->rig_antenna = -1;
+  for (int i = 0; i <= N_BAND; ++i) radio->rig_antenna_band[i] = -1;
+  radio->scope_level_x2 = 999;
+  radio->scope_cursor_restore_pending = 0;
+  radio->scope_cursor_restore_due_ms = 0;
+  for (int i = 0; i <= N_BAND; ++i) {
+    radio->scope_level_band_x2[i] = 999;
+    radio->preamp_band[i] = -1;
+  }
   radio->smeter = 0;
   radio->smeter_peak = SMETER_MINIMUM_DBM;
   radio->bandid = 0;
   radio->bandid_prev = 0;
+  radio->bandid_target = 0;
   radio->enabled = 0;
   radio->band_mask = 0;  // all band may be switched by default
   radio->band_mask_priority = 0;
@@ -5634,7 +6322,10 @@ void init_radio(struct radio *radio, const char *rig_name) {
 
   for (int k = 0; k < N_BAND; k++) {
 
-    radio->modetype_bank[k]=0; // clear modetype_bank    
+    radio->modetype_bank[k]=0; // clear modetype_bank
+    radio->last_modebank[k]=0;
+    radio->last_filtbank[k]=0;
+    radio->last_cqbank[k]=LOG_SandP;    
     for (int i = 0; i < 4; i++) {
       radio->cq_bank[k][i]=0; // clear cq_bank      
       for (int j = 0; j < 2; j++) {
@@ -6356,8 +7047,50 @@ void adjust_frequency(int dfreq) {
   }
 }
 
+
+static void save_band_last_state(struct radio *radio)
+{
+  if (!radio) return;
+
+  const int b = freq2bandid(radio->freq);
+  const int mt = radio->modetype;
+  if (b <= 0 || b >= N_BAND) return;
+  if (mt != LOG_MODETYPE_CW &&
+      mt != LOG_MODETYPE_PH &&
+      mt != LOG_MODETYPE_DG) return;
+
+  const int cq = radio->cq[mt] ? LOG_CQ : LOG_SandP;
+
+  radio->modetype_bank[b] = mt;
+  radio->last_modebank[b] = rig_modenum(radio->opmode);
+  radio->last_filtbank[b] = radio->filt;
+  radio->last_cqbank[b] = cq;
+
+  radio->cq_bank[b][mt] = cq;
+  radio->modebank[b][cq][mt] = radio->last_modebank[b];
+  radio->filtbank[b][cq][mt] = radio->filt;
+  if (freq2bandid(radio->freq) == b)
+    radio->freqbank[b][cq][mt] = radio->freq;
+
+  if (verbose & 16) {
+    console->printf(
+        "BANDSAVE b=%d mt=%d cq=%d freq=%u mode=%d(%s) filt=%d\n",
+        b, mt, cq, radio->freq, radio->last_modebank[b],
+        radio->opmode, radio->last_filtbank[b]);
+  }
+}
+
 void save_freq_mode_filt(struct radio *radio) {
-  radio->bandid = freq2bandid(radio->freq);  // make sure that these are always matching
+  save_band_last_state(radio);
+  const int actual_bandid = freq2bandid(radio->freq);
+  if (actual_bandid <= 0 || actual_bandid >= N_BAND) {
+    if (verbose & 16)
+      console->printf("save_freq_mode_filt reject freq=%u derived=%d\n",
+                      radio->freq, actual_bandid);
+    return;
+  }
+  radio->bandid = actual_bandid;
+  radio->bandid_prev = actual_bandid;
   if (verbose &4) {
     if (!plogw->f_console_emu) {
       plogw->ostream->print("save f=");
@@ -6380,9 +7113,16 @@ void save_freq_mode_filt(struct radio *radio) {
   radio->cq_bank[radio->bandid][radio->modetype]=radio->cq[radio->modetype];
   radio->modetype_bank[radio->bandid]=radio->modetype;
   // then save freq
-  radio->freqbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype] = radio->freq;
+  if (freq2bandid(radio->freq) == radio->bandid) {
+    radio->freqbank[radio->bandid]
+                   [radio->cq[radio->modetype]]
+                   [radio->modetype] = radio->freq;
+  }
   radio->modebank[radio->bandid][radio->cq[radio->modetype]][radio->modetype] = rig_modenum(radio->opmode);
   radio->filtbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype] = radio->filt;
+  radio->last_modebank[radio->bandid] = rig_modenum(radio->opmode);
+  radio->last_filtbank[radio->bandid] = radio->filt;
+  radio->last_cqbank[radio->bandid] = radio->cq[radio->modetype];
 }
 
 static void recall_freq_mode_filt_impl(struct radio *radio, int target_modetype, bool force_modetype) {
@@ -6413,6 +7153,15 @@ static void recall_freq_mode_filt_impl(struct radio *radio, int target_modetype,
 
   // then recover freq
   freq = radio->freqbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype];
+  if (freq != 0 && freq2bandid((unsigned int)freq) != radio->bandid) {
+    if (verbose & 16)
+      console->printf("recall discard bank=%d freq=%d derived=%d\n",
+                      radio->bandid, freq, freq2bandid((unsigned int)freq));
+    radio->freqbank[radio->bandid]
+                   [radio->cq[radio->modetype]]
+                   [radio->modetype] = 0;
+    freq = 0;
+  }
 
   if (!plogw->f_console_emu) {
     plogw->ostream->print("recall f=");
@@ -6448,6 +7197,24 @@ static void recall_freq_mode_filt_impl(struct radio *radio, int target_modetype,
   modenum = radio->modebank[radio->bandid][radio->cq[radio->modetype]][radio->modetype];
   filt = radio->filtbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype];
 
+  // rig_modenum("LSB") is 0.  Therefore mode==0 is NOT by itself an
+  // uninitialized bank.  Only use the band-wide fallback when both mode and
+  // filter are still empty; otherwise a valid PH/LSB bank can be overwritten
+  // by the last CW mode.
+  if (modenum == 0 && filt == 0 &&
+      radio->last_modebank[radio->bandid] != 0) {
+    modenum = radio->last_modebank[radio->bandid];
+    radio->modebank[radio->bandid]
+                   [radio->cq[radio->modetype]]
+                   [radio->modetype] = modenum;
+  }
+  if (filt == 0 && radio->last_filtbank[radio->bandid] != 0) {
+    filt = radio->last_filtbank[radio->bandid];
+    radio->filtbank[radio->bandid]
+                   [radio->cq[radio->modetype]]
+                   [radio->modetype] = filt;
+  }
+
   // A manual rig has no CAT response that can update the local mode/filter
   // state after a bank recall.  Keep DVPlogger's internal state in sync with
   // the recalled bank before updating the display and bandmap.
@@ -6480,9 +7247,92 @@ static void recall_freq_mode_filt_impl(struct radio *radio, int target_modetype,
     plogw->ostream->println("");
   }
 
-  send_mode_set_civ(opmode_string(modenum), filt);
-  // also send bandscope width here? 25/5/5
-  set_scope_mode(radio,modenum);
+  // Explicit CW/PH bank recall: request the concrete rig mode on this radio
+  // and change the scope span from the recalled mode at the same time.
+  // request_mode_change_radio() also prevents transient CAT reports from
+  // corrupting the selected modetype while the rig is changing mode.
+  request_mode_change_radio(opmode_string(modenum), filt, radio);
+  // Scope span is applied after the rig reports that the requested mode has
+  // actually become active.  Sending it here can be overwritten by the
+  // Yaesu mode-change/band-stack processing.
+
+  if (verbose & 16)
+    console->printf("MODEBANK_RECALL b=%d mt=%d cq=%d mode=%d(%s) filt=%d freq=%d\n",
+                    radio->bandid, radio->modetype,
+                    radio->cq[radio->modetype], modenum,
+                    opmode_string(modenum), filt, freq);
+}
+
+void recall_freq_mode_filt_for_band(int target_bandid, struct radio *radio) {
+  if (!radio || target_bandid <= 0 || target_bandid >= N_BAND) return;
+
+  int target_modetype = radio->modetype_bank[target_bandid];
+  if (target_modetype != LOG_MODETYPE_CW &&
+      target_modetype != LOG_MODETYPE_PH &&
+      target_modetype != LOG_MODETYPE_DG) {
+    target_modetype = radio->modetype;
+  }
+  if (target_modetype != LOG_MODETYPE_CW &&
+      target_modetype != LOG_MODETYPE_PH &&
+      target_modetype != LOG_MODETYPE_DG) {
+    target_modetype = LOG_MODETYPE_CW;
+  }
+
+  unsigned int target_cq = radio->cq_bank[target_bandid][target_modetype];
+  if (target_cq != LOG_CQ && target_cq != LOG_SandP)
+    target_cq = radio->last_cqbank[target_bandid];
+  if (target_cq != LOG_CQ && target_cq != LOG_SandP)
+    target_cq = LOG_SandP;
+
+  unsigned int target_freq =
+      radio->freqbank[target_bandid][target_cq][target_modetype];
+  int modenum =
+      radio->modebank[target_bandid][target_cq][target_modetype];
+  int filt =
+      radio->filtbank[target_bandid][target_cq][target_modetype];
+
+  if (target_freq == 0 || freq2bandid(target_freq) != target_bandid) {
+    const int saved_modetype = radio->modetype;
+    radio->modetype = target_modetype;
+    target_freq = (unsigned int)bandid2freq(target_bandid, radio);
+    radio->modetype = saved_modetype;
+
+    const char *opmode = default_opmode(target_bandid, target_modetype);
+    modenum = radio->last_modebank[target_bandid];
+    if (modenum == 0) modenum = rig_modenum(opmode);
+    filt = radio->last_filtbank[target_bandid];
+    if (filt == 0) filt = default_filt(opmode);
+
+    if (target_freq != 0 && freq2bandid(target_freq) == target_bandid) {
+      radio->freqbank[target_bandid][target_cq][target_modetype] = target_freq;
+      radio->modebank[target_bandid][target_cq][target_modetype] = modenum;
+      radio->filtbank[target_bandid][target_cq][target_modetype] = filt;
+    }
+  }
+
+  if (target_freq == 0 || freq2bandid(target_freq) != target_bandid) {
+    if (verbose & 16)
+      console->printf("band target invalid b=%d freq=%u\\n",
+                      target_bandid, target_freq);
+    return;
+  }
+
+  radio->bandid_target = target_bandid;
+  radio->f_recall_freq_mode_filt = 1;
+  radio->modetype_bank[target_bandid] = target_modetype;
+  radio->cq_bank[target_bandid][target_modetype] = target_cq;
+  radio->last_cqbank[target_bandid] = target_cq;
+  radio->last_modebank[target_bandid] = modenum;
+  radio->last_filtbank[target_bandid] = filt;
+
+  if (verbose & 16)
+    console->printf("band target b=%d freq=%u actual b=%d freq=%u\\n",
+                    target_bandid, target_freq, radio->bandid, radio->freq);
+
+  set_frequency_rig_radio(target_freq, radio);
+  send_mode_set_civ_radio(opmode_string(modenum), filt, radio);
+  // Scope span is intentionally deferred until the target frequency report
+  // confirms that the rig has completed its band-stack transition.
 }
 
 void recall_freq_mode_filt(struct radio *radio) {

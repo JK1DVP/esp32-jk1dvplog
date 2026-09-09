@@ -36,6 +36,8 @@ void set_log_rst(struct radio *radio) ;
 void enable_radios(int idx_radio, int radio_cmd) ;
 void switch_bands(struct radio *radio) ;
 void band_change(int bandid, struct radio *radio);
+void band_change_from(int bandid, struct radio *radio, const char *source);
+void switch_bands_from(struct radio *radio, const char *source);
 void init_logwindow() ;
 void display_partial_check(struct radio * radio);
 int exch_partial_check(struct radio *radio,char *exch,unsigned char bandmode,unsigned char mask,int callhist_check,struct check_entry_list *entry_list);

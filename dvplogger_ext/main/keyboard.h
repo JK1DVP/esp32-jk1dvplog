@@ -22,4 +22,6 @@
 #define FILE_KEYBOARD_H
 void init_keyboard();
 void loop_keyboard();
+void set_ch9350_diag_enabled(bool enabled);
+bool ch9350_diag_enabled();
 #endif

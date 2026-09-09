@@ -272,6 +272,11 @@ void emulate_keyboard_cardkey(char c) {
     plogw->ostream->print(" alt=");
     plogw->ostream->println(modkey.bmLeftAlt);
   }
+  if ((verbose & 16) && ((uint8_t)key == 0x36 || (uint8_t)key == 0x37)) {
+    Serial.printf("KBDLOW t=%lu src=CARDKEY hid=0x%02X mod=0x%02X on=1\n",
+                  (unsigned long)millis(), (unsigned int)(uint8_t)key,
+                  (unsigned int)(*((uint8_t *)&modkey)));
+  }
   on_key_down(modkey, (uint8_t)key, (uint8_t)c);
   plogw->ostream->flush();
   

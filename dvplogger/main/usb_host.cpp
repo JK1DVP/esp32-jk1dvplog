@@ -2070,12 +2070,33 @@ void receive_pkt_handler_keyboard1_main(struct mux_packet *packet)
 
   if (packet->idx >= 3) {
     const uint8_t received_seq = (uint8_t)packet->buf[2];
-    if (seq_valid && received_seq != expected_seq) {
-      Serial.printf("KBD EXT sequence gap expected=%u received=%u; resync\n",
-                    (unsigned int)expected_seq,
-                    (unsigned int)received_seq);
-      Prs1.resync_extKbd("sequence gap");
+
+    if (seq_valid) {
+      const uint8_t previous_seq = (uint8_t)(expected_seq - 1);
+
+      if (received_seq == previous_seq) {
+        // Exact retransmission/duplicate.  Do NOT resync and, importantly,
+        // do NOT pass the same key transition to Parse_extKbd() twice.
+        if (verbose & 16) {
+          Serial.printf(
+              "KBD EXT duplicate seq=%u expected=%u hid=0x%02X on=%u; ignored\n",
+              (unsigned int)received_seq, (unsigned int)expected_seq,
+              packet->idx >= 1 ? (unsigned int)(uint8_t)packet->buf[0] : 0U,
+              packet->idx >= 2 && packet->buf[1] ? 1U : 0U);
+        }
+        return;
+      }
+
+      if (received_seq != expected_seq) {
+        // Genuine gap/out-of-order event: parser state may no longer match
+        // the extension keyboard, so resync before accepting this event.
+        Serial.printf("KBD EXT sequence gap expected=%u received=%u; resync\n",
+                      (unsigned int)expected_seq,
+                      (unsigned int)received_seq);
+        Prs1.resync_extKbd("sequence gap");
+      }
     }
+
     expected_seq = (uint8_t)(received_seq + 1);
     seq_valid = true;
   }
@@ -2111,12 +2132,33 @@ void KbdRptParser::resync_extKbd(const char *reason)
   buf_ext[0] = 0;
   f_capslock = 0;
 
-  Serial.printf("KBD EXT resync reason=%s old_mod=0x%02X\n",
+  Serial.printf("KBD EXT resync t=%lu reason=%s old_mod=0x%02X\n",
+                (unsigned long)millis(),
                 reason ? reason : "unknown", (unsigned int)old_mod);
 }
 
 void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on) 
 {
+  if ((verbose & 16) && (hid_code == 0x36 || hid_code == 0x37)) {
+    bool already_pressed = false;
+    int slot = -1;
+    for (uint8_t i = 2; i < 8; i++) {
+      if (prevState.bInfo[i] == hid_code) {
+        already_pressed = true;
+        slot = i;
+        break;
+      }
+    }
+    Serial.printf(
+        "EXT_RAW t=%lu hid=0x%02X on=%d mod=0x%02X pressed=%d slot=%d "
+        "keys=%02X,%02X,%02X,%02X,%02X,%02X\n",
+        (unsigned long)millis(), (unsigned int)hid_code, on ? 1 : 0,
+        (unsigned int)prevState.bInfo[0],
+        already_pressed ? 1 : 0, slot,
+        (unsigned int)prevState.bInfo[2], (unsigned int)prevState.bInfo[3],
+        (unsigned int)prevState.bInfo[4], (unsigned int)prevState.bInfo[5],
+        (unsigned int)prevState.bInfo[6], (unsigned int)prevState.bInfo[7]);
+  }
   /*
    * The extension-board keyboard reports each key transition separately.
    * Treating CapsLock as Ctrl later through f_capslock is racy for chords:
@@ -2169,6 +2211,15 @@ void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on)
     msg.arg2=buf_ext[0x00];
     msg.type=KEYMSG_TYPE_ONCONTROLKEYSCHANGED;
     send_keyrpt_queue();
+  }
+
+  // HID usages 0xE0..0xE7 are modifier keys, not ordinary scan codes.
+  // The old code fell through here and also inserted Alt/Ctrl/Shift into
+  // prevState.bInfo[2..7], producing states such as keys=E2,37,01,...
+  // and making the external-keyboard pressed list inconsistent.
+  if (bmask != 0) {
+    prevState.bInfo[0] = buf_ext[0];
+    return;
   }
 
   bool found=false;  
@@ -2407,6 +2458,13 @@ void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
 
       case KEYMSG_TYPE_ONKEYDOWN:
         handler_name = "keydown";
+        if ((verbose & 16) &&
+            (msg.arg2 == 0x10 || msg.arg2 == 0x36 || msg.arg2 == 0x37)) {
+          Serial.printf("KBDLOW t=%lu src=%s hid=0x%02X mod=0x%02X on=1 depth=%u\n",
+                        (unsigned long)millis(), name,
+                        (unsigned int)msg.arg2, (unsigned int)msg.arg1,
+                        (unsigned int)uxQueueMessagesWaiting(xQueueKeyRpt));
+        }
         OnKeyDown(msg.arg1, msg.arg2);
         dt = (uint32_t)(micros() - handler_start_us);
         if (dt > st.max_keydown_us) st.max_keydown_us = dt;

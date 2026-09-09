@@ -491,8 +491,9 @@ void set_vfo_frequency_rig(int freq, int vfo, struct radio *radio)
       send_tail_civ(radio);
       break;
 
-    case 2:  // FT-991A  Yaesu cat
-    case 3:  // QCX-mini Kenwood cat
+    case RIG_TYPE_YAESU:       // FT-991A/FTDX10 Yaesu CAT
+    case RIG_TYPE_YAESU_FTX1:  // FTX-1 Yaesu CAT
+    case RIG_TYPE_KENWOOD:     // QCX-mini / Kenwood CAT
       // currently just send frequency for these rig types
       // no VFO selection. 22/8/25
       int type;

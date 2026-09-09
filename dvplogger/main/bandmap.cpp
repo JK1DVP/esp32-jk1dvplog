@@ -507,7 +507,9 @@ int set_station_entry(struct radio *radio, char *station, unsigned int freq, con
   /* Alt-Space always starts/continues S&P on the selected target radio. */
   radio->cq[target_modetype] = LOG_SandP;
   radio->cq_bank[target_bandid][target_modetype] = LOG_SandP;
+  radio->last_cqbank[target_bandid] = LOG_SandP;
   radio->modetype_bank[target_bandid] = target_modetype;
+  radio->last_modebank[target_bandid] = modenum;
 
   int filt = radio->filtbank[target_bandid][LOG_SandP][target_modetype];
   if (filt == 0) {
@@ -519,25 +521,19 @@ int set_station_entry(struct radio *radio, char *station, unsigned int freq, con
    * rather than waiting for the CAT response, so a rapid CQ/S&P switch cannot
    * recall the previous S&P frequency.
    */
+  if (freq2bandid(freq) != target_bandid) return 0;
   radio->freqbank[target_bandid][LOG_SandP][target_modetype] = freq;
   radio->modebank[target_bandid][LOG_SandP][target_modetype] = modenum;
   radio->filtbank[target_bandid][LOG_SandP][target_modetype] = filt;
+  radio->last_filtbank[target_bandid] = filt;
 
   set_callsign_and_request_dupe(radio, station, true);
 
   /*
-   * Reflect the selected spot in the chosen radio immediately.  The CAT
-   * acknowledgement may arrive later; until then, display and band matching
-   * must not continue to use the old frequency/mode from this radio.
+   * A bandmap spot is a target selection.  Do not fabricate actual radio
+   * freq/bandid before CAT confirmation; set_frequency_rig_radio() records
+   * freq_target/bandid_target and the rig report later commits actual state.
    */
-  radio->freq_prev = radio->freq;
-  radio->freq = freq;
-  radio->freq_target = freq;
-  radio->bandid_prev = radio->bandid;
-  radio->bandid = target_bandid;
-  radio->bandid_bandmap = target_bandid;
-  set_mode(opmode_str, filt, radio);
-  radio->filt = filt;
   bandmap_disp.f_update = 1;
 
   /* Do not fall back to the focused radio: program the chosen radio itself. */

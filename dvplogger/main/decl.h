@@ -283,6 +283,21 @@ struct radio {
   int f_qsl; // 0 N(OQSL) 1:J(arl) 2:hQSL
   int power; // rig power
   int power_bak ; // save original power setting when tune
+  int power_source; // model-specific power path; FTX-1: 1=head, 2=SPA-1
+
+  // Rig-internal antenna connector selection, independent of the external
+  // OTRSP/relay antenna switch.  Values: -1 unknown, 1 ANT1, 2 ANT2.
+  int rig_antenna;
+  int rig_antenna_band[N_BAND + 1];
+
+  // Yaesu scope/receiver settings learned from the rig and remembered per
+  // DVPlogger band.  scope_level_x2 is in 0.5 dB units; 999 means unknown.
+  int scope_level_x2;
+  int scope_level_band_x2[N_BAND + 1];
+  int preamp_band[N_BAND + 1];  // -1 unknown, 0 IPO/OFF, 1 AMP1/ON, 2 AMP2
+  int scope_cursor_restore_pending;
+  uint32_t scope_cursor_restore_due_ms;
+
   char tm_loaded[20]; // time of the QSO loaded from SD
   int seqnr_loaded; // sequential number of the QSO loaded from SD
   char opmode_loaded[8];
@@ -313,8 +328,9 @@ struct radio {
   int freq_change_count;
   unsigned int freq_change_candidate; // candidate frequency for manual dial-change confirmation
   int freqchange_program_guard; // suppress late CAT echoes after a program-originated frequency change
-  int bandid; // bandid for the current frequency from 1
+  int bandid; // actual bandid: derived only from the last accepted rig frequency
   int bandid_prev;
+  int bandid_target; // program-requested band while CAT QSY is pending; 0 otherwise
   
   int bandid_bandmap;// current bandid for the bandmap display
 
@@ -323,9 +339,12 @@ struct radio {
 
   unsigned int freqbank[N_BAND][2][4]; // current operating frequency for cq 1 cq 0 s&p and modetype  mode 1 cw 2 ph 3 digi 0 not defined
   unsigned int cq_bank[N_BAND][4]; // state of cq/sp (1bit) in each band and modetype (2bit) 
-  unsigned int modetype_bank[N_BAND]; // state of modetype (2bit) in each band  
-  int filtbank[N_BAND][2][4]; // current filter setting for the mode
-  int modebank[N_BAND][2][4];
+  unsigned int modetype_bank[N_BAND]; // last operating class (CW/PH/DG) in each band
+  int last_modebank[N_BAND];            // last concrete rig mode (USB/FM/CW/CW-R/...)
+  int last_filtbank[N_BAND];            // filter paired with last_modebank[]
+  unsigned int last_cqbank[N_BAND];     // CQ/S&P state for the band's last modetype
+  int filtbank[N_BAND][2][4]; // filter per band/CQ-SP/modetype
+  int modebank[N_BAND][2][4]; // concrete rig mode per band/CQ-SP/modetype
 
   unsigned int freq, freq_prev;
   unsigned int freq_target;
@@ -351,12 +370,24 @@ struct radio {
   bool cq[4]; // current operation 1 cq 0 s&p      /// cq[modetype]
 
   // CW S&P transmit offset control. xit_offset_hz is persistent via settings.
-  bool xit_enabled;
+  bool rit_enabled;      // RX clarifier/RIT state
+  int rit_offset_hz;      // RIT offset; forced to 0 whenever RIT is OFF
+  byte rit_xit_adjust_target; // 0=normal VFO, 1=RIT, 2=XIT
+  bool xit_enabled;      // TX clarifier/XIT requested state
   int xit_offset_hz;
+  int yaesu_width_cycle; // F11 local cycle index, 0..2
+  int yaesu_agc_mode;    // F12: 1 FAST, 2 MID, 3 SLOW, 4 AUTO
 
   int multi; // multiplier id of the qso (start from zero)
   int modetype; // operation mode type 0 not defined (initial state) 1 cw 2 ph  3 digi
   int modetype_prev; // to check modetype change
+
+  // Program-originated mode change transaction.  Actual mode remains the last
+  // mode confirmed by the rig; target is separate while CAT change is pending.
+  int f_modechange_pending;
+  int mode_target_modenum;
+  int mode_target_filt;
+  char mode_target_opmode[8];
 
   // s meter reading
   int smeter; int smeter_peak;

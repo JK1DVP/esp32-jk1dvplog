@@ -46,7 +46,7 @@
 #include "mux_transport.h"
 #include "callhist_remote.h"
 
-enum QueryCIVType {Freq,Mode,Smeter,Ptt,Id,Preamp,Gps,Att,Power};
+enum QueryCIVType {Freq,Mode,Smeter,Ptt,Id,Preamp,Gps,Att,Power,RigAnt,ScopeLevel};
 void send_query_civ(enum QueryCIVType type,struct radio *radio) {
   switch(type) {
   case Freq:		send_freq_query_civ(radio);break;//0
@@ -58,6 +58,8 @@ void send_query_civ(enum QueryCIVType type,struct radio *radio) {
   case Preamp:		send_preamp_query_civ(radio);break;   //7 
   case Gps:		send_gps_query_civ(radio); break; 
   case Power:   send_power_query_civ(radio); break;
+  case RigAnt:  send_rig_antenna_query(radio); break;
+  case ScopeLevel: send_yaesu_scope_level_query(radio); break;
   }
 }
 
@@ -162,6 +164,7 @@ void interval_process() {
   static int query_item = 0;
   next_interval = 100;
   service_icom_clock_sync();
+  service_yaesu_scope();
   antenna_process();
   interval_diag_mark(&interval_diag, "antenna");
   if (f_mux_transport) mux_transport.recv_pkt();
@@ -226,9 +229,11 @@ void interval_process() {
 	    case 8:send_query_civ(Att,radio); break;
 	    case 9:send_query_civ(Gps,radio); break;
 	    case 10:send_query_civ(Power,radio); break;
+	    case 11:send_query_civ(RigAnt,radio); break;
+	    case 12:send_query_civ(ScopeLevel,radio); break;
 	    }
 	    query_item++;
-	    if (query_item >= 11) query_item = 0;
+	    if (query_item >= 13) query_item = 0;
 	    break;
 	  }
 	} else {
@@ -245,22 +250,22 @@ void interval_process() {
 	    break;
 	  case 5:  // slow/status query 
 	    switch(query_item) {
-	    case 0:send_query_civ(Id,radio); break;	    	    
-	    case 1:send_query_civ(Ptt,radio); break;       // 6
-	    case 2:send_query_civ(Freq,radio); break;       // 6
-	    case 3:send_query_civ(Mode,radio); break;       // 6
-	    case 4:send_query_civ(Smeter,radio); break;	    
-	    case 5:send_query_civ(Preamp,radio); break;       // 6
-	    case 6:send_query_civ(Ptt,radio); break;        // 6
-	    case 7:send_query_civ(Freq,radio); break;       // 6
-	    case 8:send_query_civ(Mode,radio); break;       // 6
-	    case 9:send_query_civ(Smeter,radio); break;	    
-	    case 10:send_query_civ(Att,radio); break;       // 6
-	    case 11:send_query_civ(Gps,radio); break;       // 6	      
-	    case 12:send_query_civ(Power,radio); break;
+	    case 0:send_query_civ(Id,radio); break;
+	    case 1:send_query_civ(Ptt,radio); break;
+	    case 2:send_query_civ(Mode,radio); break;
+	    case 3:send_query_civ(Smeter,radio); break;
+	    case 4:send_query_civ(Preamp,radio); break;
+	    case 5:send_query_civ(Ptt,radio); break;
+	    case 6:send_query_civ(Mode,radio); break;
+	    case 7:send_query_civ(Smeter,radio); break;
+	    case 8:send_query_civ(Att,radio); break;
+	    case 9:send_query_civ(Gps,radio); break;
+	    case 10:send_query_civ(Power,radio); break;
+	    case 11:send_query_civ(RigAnt,radio); break;
+	    case 12:send_query_civ(ScopeLevel,radio); break;
 	    }
 	    query_item++;
-	    if (query_item >= 11) query_item = 0;
+	    if (query_item >= 13) query_item = 0;
 	    break;
 	  }
 	}

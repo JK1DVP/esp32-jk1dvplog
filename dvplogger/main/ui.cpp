@@ -133,6 +133,25 @@ static constexpr int HELP_PAGE_COUNT =
 #include "so2r.h"
 #include "dac-adc.h"
 #include "morse_decoder_simple.h"
+
+static void trace_band_key_event(const char *name, int key,
+                                 const MODIFIERKEYS &modkey,
+                                 struct radio *radio)
+{
+  if (!(verbose & 16) || !radio) return;
+  console->printf(
+      "KEYEV t=%lu src=%s radio=%d key=0x%02X "
+      "LAlt=%d RAlt=%d LCtrl=%d RCtrl=%d LShift=%d RShift=%d "
+      "actual=%u/b%d pending=%d target=%u/b%d\n",
+      (unsigned long)millis(), name, radio->rig_idx, key,
+      modkey.bmLeftAlt, modkey.bmRightAlt,
+      modkey.bmLeftCtrl, modkey.bmRightCtrl,
+      modkey.bmLeftShift, modkey.bmRightShift,
+      radio->freq, radio->bandid,
+      radio->f_freqchange_pending,
+      radio->freq_target, radio->bandid_target);
+}
+
 #include "esp32_flasher.h"
 
 
@@ -745,8 +764,8 @@ if (key == 0x1f) {
       }
       return;
     }
-    if (key == 0x2d) {  // Alt-'-'  scope setting
-      set_scope();
+    if (key == 0x2d) {  // Alt-'-'  recenter spectrum scope
+      recenter_scope();
       return;
     }
     /*  if (key == 0x19) { // Alt-v 0x19 // this is removed to avoid unaware invoking verbose condition
@@ -801,7 +820,14 @@ if (key == 0x1f) {
       // Save the current bank, then recall exactly the requested bank.
       // recall_freq_mode_filt() normally follows modetype_bank and could
       // otherwise restore the bank that we have just left.
+      const int source_modetype = radio->modetype;
       save_freq_mode_filt(radio);
+
+      if (verbose & 16)
+        console->printf("CWPH_SWITCH b=%d from_mt=%d to_mt=%d op=%s\n",
+                        radio->bandid, source_modetype,
+                        target_modetype, radio->opmode);
+
       recall_freq_mode_filt_for_modetype(radio, target_modetype);
 
       // Manual rigs have no CAT response that would trigger a later right-side
@@ -1053,13 +1079,16 @@ if (key == 0x1f) {
     }
     if (key == 0x37) {
       // Alt->,  Alt-<. manual band change up/down
-      switch_bands(radio);
+      trace_band_key_event("KEY-BAND-UP", key, modkey, radio);
+      switch_bands_from(radio, "KEY-BAND-UP");
     }
     if (key == 0x36) {
       // Alt->  Alt-< manual band change up/down
       int tmp, count;
       count = 0;
-      tmp = radio->bandid;
+      tmp = (radio->f_freqchange_pending && radio->bandid_target > 0)
+                ? radio->bandid_target
+                : radio->bandid;
       while (count < N_BAND) {
 	tmp--;
 	if (tmp == 0) tmp = N_BAND - 1;
@@ -1071,6 +1100,7 @@ if (key == 0x1f) {
 	}
 	if (((1 << (tmp - 1)) & radio->band_mask) == 0) {
 	  // ok to change
+	  trace_band_key_event("KEY-BAND-DOWN", key, modkey, radio);
 	  band_change(tmp, radio);
 	  break;
 	}
@@ -1101,6 +1131,7 @@ if (key == 0x1f) {
     }
 
     if (key == 0x10) {
+      trace_band_key_event("KEY-ALT-M", key, modkey, radio);
       //      plogw->ostream->print("before radio->modetype=");
       //      plogw->ostream->println(radio->modetype);      
       
@@ -1110,12 +1141,15 @@ if (key == 0x1f) {
       mode = switch_rigmode();
       
       int filt;
-      filt = radio->filtbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype];
-      if (filt==0) {
-	filt=default_filt(radio->opmode);
+      int target_modetype = modetype_string(mode);
+      if (target_modetype <= 0) target_modetype = radio->modetype;
+      filt = radio->filtbank[radio->bandid]
+                            [radio->cq[target_modetype]]
+                            [target_modetype];
+      if (filt == 0) {
+        filt = default_filt(mode);
       }
-      set_mode(mode, filt, radio);
-      send_mode_set_civ(mode, filt);
+      request_mode_change_radio(mode, filt, radio);
 
       //      plogw->ostream->print("after radio->modetype=");
       //      plogw->ostream->println(radio->modetype);      
@@ -1698,13 +1732,19 @@ if (key == 0x1f) {
     case 0x51:  // DOWN
     case 0x52: { // UP
       struct radio *xr = so2r.radio_selected();
-      if (xr != NULL && xr->xit_enabled && xit_control_supported(xr) &&
-          xr->cq[xr->modetype] == LOG_SandP) {
-        xr->xit_offset_hz += (key == 0x52) ? 20 : -20;
-        if (xr->xit_offset_hz > 9999) xr->xit_offset_hz = 9999;
-        if (xr->xit_offset_hz < -9999) xr->xit_offset_hz = -9999;
-        apply_xit_for_operating_mode(xr);
-        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "XIT %+d Hz", xr->xit_offset_hz);
+      const int delta = (key == 0x52) ? 20 : -20;
+      if (xr != NULL && xr->rit_xit_adjust_target == 1 &&
+          xr->rit_enabled && rit_control_supported(xr)) {
+        adjust_rit_xit_offset(xr, delta);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "RIT %+d Hz", xr->rit_offset_hz);
+        upd_display_info_flash(dp->lcdbuf);
+        info_disp.timer = 1000;
+      } else if (xr != NULL && xr->rit_xit_adjust_target == 2 &&
+                 xr->xit_enabled && xit_control_supported(xr)) {
+        adjust_rit_xit_offset(xr, delta);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "XIT %+d Hz", xr->xit_offset_hz);
         upd_display_info_flash(dp->lcdbuf);
         info_disp.timer = 1000;
       } else {
@@ -1733,7 +1773,78 @@ if (key == 0x1f) {
       // Ctrl-W wipe
       // Space/Tab jump
     default:
-      // no mod 
+      // no modifier
+      // F9-F12 are local operating controls. F1-F7 remain message memories.
+      if (key >= 0x42 && key <= 0x45) {
+        struct radio *xr = so2r.radio_selected();
+
+        if (key == 0x42) { // F9: RIT / RX CLAR toggle
+          if (xr == NULL || !rit_control_supported(xr)) {
+            snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "F9 RIT\nUNSUPPORTED");
+          } else {
+            set_rit_control(xr, !xr->rit_enabled);
+            snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                     "RIT %s\nXIT %s",
+                     xr->rit_enabled ? "ON" : "OFF",
+                     xr->xit_enabled ? "ARMED" : "OFF");
+          }
+        } else if (key == 0x43) { // F10: XIT / TX CLAR toggle
+          // CI-V RIT/XIT uses the same command family.  In particular,
+          // IC-9700 already passes rit_control_supported(), so do not reject
+          // F10 merely because an older per-rig XIT capability test says no.
+          const bool icom_rit_xit =
+              xr != NULL && xr->rig_spec != NULL &&
+              xr->rig_spec->cat_type == CAT_TYPE_CIV &&
+              rit_control_supported(xr);
+          if (xr == NULL ||
+              (!icom_rit_xit && !xit_control_supported(xr))) {
+            snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "F10 XIT\nUNSUPPORTED");
+          } else {
+            xr->xit_enabled = !xr->xit_enabled;
+            if (xr->xit_enabled) {
+              select_xit_adjust_target(xr);
+              apply_xit_for_operating_mode(xr);
+              snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                       "XIT ON\n%+d Hz\n%s",
+                       xr->xit_offset_hz,
+                       xr->cq[xr->modetype] == LOG_SandP
+                           ? "S&P ACTIVE" : "CQ: 0 Hz");
+            } else {
+              set_xit_control(xr, false);
+              set_xit_offset_hz(xr, 0);
+              if (xr->rit_xit_adjust_target == 2)
+                xr->rit_xit_adjust_target = 0;
+              snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                       "XIT OFF\nsaved %+d Hz", xr->xit_offset_hz);
+            }
+          }
+        } else if (key == 0x44) { // F11: receiver filter / WIDTH cycle
+          const int val = xr ? cycle_rx_filter(xr) : -1;
+          if (val < 0)
+            snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                     "F11 FILTER\nUNSUPPORTED");
+          else if (xr->rig_spec->cat_type == CAT_TYPE_CIV)
+            snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                     "RX FILTER\nFIL%d", val);
+          else
+            snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                     "RX WIDTH\n%d Hz", val);
+        } else { // 0x45 F12: receiver AGC cycle
+          const int agc = xr ? cycle_rx_agc(xr) : -1;
+          const char *name =
+              agc == 1 ? "FAST" :
+              agc == 2 ? "MID" :
+              agc == 3 ? "SLOW" :
+              agc == 4 ? "AUTO" : "UNSUPPORTED";
+          snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                   "AGC\n%s", name);
+        }
+
+        upd_display_info_flash(dp->lcdbuf);
+        info_disp.timer = 1000;
+        break;
+      }
+
       // function keys
       if ((key >= 0x3a) && (key <= 0x45)) {
 	so2r.cancel_msg_tx();	
@@ -2320,11 +2431,14 @@ void process_enter(int option) {
     len = strlen(radio->callsign + 2);
     if (len == 0) {
       if (radio->cq[radio->modetype] == LOG_SandP) {
-        // In S&P, first give an on-frequency bandmap station a chance to
-        // populate the entry.  Continue through the normal ESM path when a
-        // station was picked; do not consume this Enter prematurely.
+        // First Enter on an empty CALLSIGN may pick the on-frequency station,
+        // but must NOT also transmit.  The next Enter runs normal ESM.
         pick_onfreq_station();
         len = strlen(radio->callsign + 2);
+        if (len != 0) {
+          request_display_update_on_demand();
+          break;
+        }
       }
 
       if (len == 0) {
@@ -2435,6 +2549,140 @@ void process_enter(int option) {
       clear_buf(radio->callsign);
       break;
     }
+    if (strncmp(radio->callsign + 2, "POWER", 5) == 0) {
+      const char *p = radio->callsign + 2 + 5;
+      int watts = -1;
+
+      if (*p == '\0' || strcmp(p, "?") == 0) {
+        // Query the rig now; the LCD shows the latest cached value
+        // immediately and the normal CAT poll updates it again shortly.
+        send_power_query_civ(radio);
+        if (radio->rig_spec &&
+            radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1) {
+          snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                   "POWER %dW\nSRC %d", radio->power, radio->power_source);
+        } else {
+          snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                   "POWER %dW", radio->power);
+        }
+        upd_display_info_flash(dp->lcdbuf);
+        clear_buf(radio->callsign);
+        break;
+      }
+
+      if (sscanf(p, "%d", &watts) == 1 && watts >= 0 && watts <= 100) {
+        set_power(radio, watts);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "POWER SET\n%d W", watts);
+      } else {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "POWER ?\nPOWER5..100");
+      }
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "CURSOR") == 0) {
+      if (!yaesu_scope_supported(radio)) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "CURSOR\nUNSUPPORTED");
+      } else {
+        // Yaesu W/F CURSOR (NORMAL): SS0670000;
+        // Use the public scope path so FTDX10/FTX-1 can be tested from LCD.
+        radio->scope_cursor_restore_pending = 0;
+        send_cat_cmd(radio, "SS0670000;");
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "SCOPE\nCURSOR");
+      }
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strncmp(radio->callsign + 2, "DLEVEL", 6) == 0) {
+      const char *p = radio->callsign + 8;
+      if (!yaesu_scope_supported(radio)) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "D-LEVEL\nUNSUPPORTED");
+      } else if (*p == '\0' || strcmp(p, "?") == 0) {
+        send_yaesu_scope_level_query(radio);
+        const int x2 = radio->scope_level_x2;
+        if (x2 >= -60 && x2 <= 60)
+          snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "D-LEVEL\n%+.1f dB",
+                   x2 / 2.0);
+        else
+          snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "D-LEVEL\nUNKNOWN");
+      } else {
+        float db = 0.0f;
+        if (sscanf(p, "%f", &db) == 1 && db >= -30.0f && db <= 30.0f) {
+          const int x2 =
+              (int)(db * 2.0f + (db >= 0 ? 0.5f : -0.5f));
+          set_yaesu_scope_level_x2(radio, x2, true);
+          snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "D-LEVEL SET\n%+.1f dB",
+                   x2 / 2.0);
+        } else {
+          snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "DLEVEL\n-30..+30");
+        }
+      }
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "IPO") == 0 ||
+        strcmp(radio->callsign + 2, "AMP1") == 0 ||
+        strcmp(radio->callsign + 2, "AMP2") == 0) {
+      if (!yaesu_scope_supported(radio)) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "PREAMP\nUNSUPPORTED");
+      } else {
+        int preamp = 0;
+        if (strcmp(radio->callsign + 2, "AMP1") == 0) preamp = 1;
+        if (strcmp(radio->callsign + 2, "AMP2") == 0) preamp = 2;
+        set_yaesu_preamp(radio, preamp, true);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "%s\nBAND %d SAVED",
+                 preamp == 0 ? "IPO" : (preamp == 1 ? "AMP1" : "AMP2"),
+                 radio->bandid);
+      }
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strncmp(radio->callsign + 2, "RIGANT", 6) == 0) {
+      const char *p = radio->callsign + 2 + 6;
+
+      if (!rig_antenna_supported(radio)) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "RIG ANT\nUNSUPPORTED");
+        upd_display_info_flash(dp->lcdbuf);
+        clear_buf(radio->callsign);
+        break;
+      }
+
+      if (*p == '\0' || strcmp(p, "?") == 0) {
+        send_rig_antenna_query(radio);
+        const int saved =
+            (radio->bandid >= 1 && radio->bandid <= N_BAND)
+                ? radio->rig_antenna_band[radio->bandid]
+                : -1;
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "RIG ANT%d\nBAND ANT%d",
+                 radio->rig_antenna > 0 ? radio->rig_antenna : 0,
+                 saved > 0 ? saved : 0);
+      } else if (strcmp(p, "1") == 0 || strcmp(p, "2") == 0) {
+        const int ant = *p - '0';
+        set_rig_antenna(radio, ant, true);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "RIG ANT%d\nBAND %d SAVED",
+                 ant, radio->bandid);
+      } else {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "RIGANT ?\nRIGANT1/2");
+      }
+
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
     if (strcmp(radio->callsign + 2, "SMETER") == 0) {
       plogw->show_smeter++;
       if (plogw->show_smeter >= 3) plogw->show_smeter = 0;
@@ -3084,7 +3332,11 @@ void process_enter(int option) {
         strcmp(radio->callsign + 2, "XITOFF") == 0 ||
         strcmp(radio->callsign + 2, "XITRESET") == 0) {
       const char *cmd = radio->callsign + 2;
-      if (!xit_control_supported(radio)) {
+      const bool icom_rit_xit =
+          radio->rig_spec != NULL &&
+          radio->rig_spec->cat_type == CAT_TYPE_CIV &&
+          rit_control_supported(radio);
+      if (!icom_rit_xit && !xit_control_supported(radio)) {
         snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
                  "XIT unsupported\n%s", radio->rig_spec->name);
       } else if (strcmp(cmd, "XITON") == 0) {

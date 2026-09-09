@@ -231,6 +231,32 @@ void process_memstat_watch()
   }
 }
 
+void set_subkbd_diag(bool enabled, Stream *output)
+{
+  Stream *out = output ? output : console;
+  if (!f_mux_transport) {
+    out->println("KBDDIAG: MUXTRANS is not active");
+    return;
+  }
+  const char *cmd = enabled ? "kbdiag:on" : "kbdiag:off";
+  mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
+                         (unsigned char *)cmd, strlen(cmd));
+  out->printf("KBDDIAG: requested %s\n", enabled ? "ON" : "OFF");
+}
+
+void query_subkbd_diag(Stream *output)
+{
+  Stream *out = output ? output : console;
+  if (!f_mux_transport) {
+    out->println("KBDDIAG: MUXTRANS is not active");
+    return;
+  }
+  const char *cmd = "kbdiag:status";
+  mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
+                         (unsigned char *)cmd, strlen(cmd));
+  out->println("KBDDIAG: status requested");
+}
+
 // main board message received
 void receive_pkt_handler_main_brd(struct mux_packet *packet)
 {
@@ -238,7 +264,23 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
   // packet->idx: number of data
   // message from ext board
   char buf[256];
-  if (verbose &4) console->println("receive_pkt_handler_main_brd()");  
+  if (verbose &4) console->println("receive_pkt_handler_main_brd()");
+  if (strncmp(packet->buf, "kbdiagack:", 10) == 0) {
+    size_t n = min((size_t)packet->idx, sizeof(buf) - 1);
+    memcpy(buf, packet->buf, n);
+    buf[n] = '\0';
+    console->printf("KBDDIAG: SUB=%s\n", buf + 10);
+    return;
+  }
+  if (strncmp(packet->buf, "kbdiag:", 7) == 0) {
+    if (verbose & 16) {
+      size_t n = min((size_t)packet->idx, sizeof(buf) - 1);
+      memcpy(buf, packet->buf, n);
+      buf[n] = '\0';
+      console->printf("SUBKBD %s\n", buf + 7);
+    }
+    return;
+  }
   if (strncmp(packet->buf,"chdone:",7)==0 ||
       strncmp(packet->buf,"chack:",6)==0 ||
       strncmp(packet->buf,"chpong",6)==0) {

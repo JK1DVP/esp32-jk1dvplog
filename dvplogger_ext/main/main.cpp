@@ -209,6 +209,24 @@ void control_pkt_handler(struct mux_packet *packet)
                            (unsigned char *)pong, strlen(pong));
     return;
   }
+  if (strncmp(packet->buf, "kbdiag:", 7) == 0) {
+    bool enable = false;
+    if (strncmp(packet->buf + 7, "on", 2) == 0) {
+      enable = true;
+      set_ch9350_diag_enabled(true);
+    } else if (strncmp(packet->buf + 7, "off", 3) == 0) {
+      enable = false;
+      set_ch9350_diag_enabled(false);
+    } else {
+      enable = ch9350_diag_enabled();
+    }
+
+    snprintf(buf, sizeof(buf), "kbdiagack:%s", enable ? "on" : "off");
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)buf, strlen(buf));
+    return;
+  }
+
   if (strncmp(packet->buf,"memstat",7)==0) {
     size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t min8 = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);

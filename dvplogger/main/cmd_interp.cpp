@@ -133,6 +133,7 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"callhist_search", "interactive Call History search; 'end' exits"},
   {"mem", "show Main CPU memory information"},
   {"memstat [watch|stop]", "show memory once or start/stop 1-second terminal watch"},
+  {"kbdiag [on|off|status]", "enable/disable SUB keyboard diagnostics (default off)"},
   {"submem", "alias of memstat"},
   {"addap <ssid> <password>", "add a Wi-Fi access point"},
   {"time [yyyy-mm-ddThh:mm:ss]", "show or set RTC time"},
@@ -182,7 +183,9 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"cp2105debug", "toggle CP2105 TX/RX debug dump"},
   {"cp2105send0 <text>", "send raw text through CP2105 port 0"},
   {"cp2105send1 <text>", "send raw text through CP2105 port 1"},
-  {"ANT0<n> / ANT1<n>", "set antenna relay 0/1 state"},
+  {"ANT0<n> / ANT1<n>", "set external antenna relay 0/1 state"},
+  {"POWER [W]", "show/query rig power, or set transmit power in watts"},
+  {"RIGANT? / RIGANT1 / RIGANT2", "query/show or set the rig internal ANT1/ANT2"},
   {"ANTALT[n]", "enable antenna alternation after n receptions"},
   {"SIGNAL", "toggle periodic signal/antenna/azimuth display"},
   {"ROT...", "rotator commands: EN, TYPE, NORTH, SOUTH, TR, AZ, STEP, SWEEP"}
@@ -355,6 +358,53 @@ void cmd_interp(char *cmd, Stream *output) {
       }
       if (strcmp("loadsat", cmd) == 0) {
 	load_satinfo();
+        break;
+      }
+      if (strncmp(cmd, "POWER", 5) == 0) {
+        struct radio *radio = so2r.radio_selected();
+        int watts = -1;
+        const char *p = cmd + 5;
+        while (*p == ' ') ++p;
+        if (*p != '\0' && sscanf(p, "%d", &watts) == 1) {
+          if (watts < 0 || watts > 100) {
+            out->println("usage: POWER [5..100]");
+          } else {
+            set_power(radio, watts);
+            out->printf("POWER set request %d W\\r\\n", watts);
+          }
+        } else {
+          send_power_query_civ(radio);
+          out->printf("POWER current=%d W", radio->power);
+          if (radio->rig_spec &&
+              radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1)
+            out->printf(" source=%d", radio->power_source);
+          out->println();
+        }
+        break;
+      }
+      if (strncmp(cmd, "RIGANT", 6) == 0) {
+        struct radio *radio = so2r.radio_selected();
+        if (!rig_antenna_supported(radio)) {
+          out->println("RIGANT unsupported by selected rig");
+          break;
+        }
+        const char *p = cmd + 6;
+        while (*p == ' ') ++p;
+        if (*p == '1' && p[1] == '\0') {
+          set_rig_antenna(radio, 1, true);
+          out->printf("RIGANT set ANT1 band=%d\\r\\n", radio->bandid);
+        } else if (*p == '2' && p[1] == '\0') {
+          set_rig_antenna(radio, 2, true);
+          out->printf("RIGANT set ANT2 band=%d\\r\\n", radio->bandid);
+        } else if (*p == '\0' || (*p == '?' && p[1] == '\0')) {
+          send_rig_antenna_query(radio);
+          const int saved = (radio->bandid >= 1 && radio->bandid <= N_BAND)
+                              ? radio->rig_antenna_band[radio->bandid] : -1;
+          out->printf("RIGANT current=%d saved-band=%d band=%d\\r\\n",
+                      radio->rig_antenna, saved, radio->bandid);
+        } else {
+          out->println("usage: RIGANT? | RIGANT1 | RIGANT2");
+        }
         break;
       }
       if (rotator_commands(cmd)) break;
@@ -739,6 +789,20 @@ void cmd_interp(char *cmd, Stream *output) {
         }
         resume_webserver_after_flash();
         out->println("[FLASHERSD] exclusive maintenance mode ended");
+        break;
+      }
+
+      if (strcmp(cmd, "kbdiag on") == 0) {
+        set_subkbd_diag(true, out);
+        break;
+      }
+      if (strcmp(cmd, "kbdiag off") == 0) {
+        set_subkbd_diag(false, out);
+        break;
+      }
+      if (strcmp(cmd, "kbdiag") == 0 ||
+          strcmp(cmd, "kbdiag status") == 0) {
+        query_subkbd_diag(out);
         break;
       }
 

@@ -432,6 +432,11 @@ static void processTelnetByte(int slot, uint8_t c) {
     MODIFIERKEYS modkey;
     *((uint8_t *)&modkey) = state.modifier;
     uint8_t ascii = kbd_oemtoascii2(state.modifier, c);
+    if ((verbose & 16) && (c == 0x36 || c == 0x37)) {
+      Serial.printf("KBDLOW t=%lu src=TCP hid=0x%02X mod=0x%02X on=1\n",
+                    (unsigned long)millis(), (unsigned int)c,
+                    (unsigned int)state.modifier);
+    }
     on_key_down(modkey, c, ascii);
     state.protocol_state = 0;
     return;

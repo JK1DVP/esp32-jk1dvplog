@@ -36,6 +36,7 @@
 #define RIG_TYPE_XIEGU_X6100 7 // Xiegu X6100 (ICOM CI-V derivative)
 #define RIG_TYPE_QMX 8 // QRP Labs QMX
 #define RIG_TYPE_ATS_MINI 9 // ATS Mini SI4732 receiver
+#define RIG_TYPE_YAESU_FTX1 10 // FTX-1 family; Yaesu CAT has model-specific PC/EX formats
 
 #define CAT_TYPE_CIV 0
 #define CAT_TYPE_YAESU_NEW 1
@@ -86,11 +87,32 @@ void send_cat_cmd(struct radio *radio, const char *cmd);
 void receive_cat_data(struct radio *radio) ;
 int freq_width_mode(char *opmode);
 void set_power(struct radio *radio, int power) ;
+void send_rig_antenna_query(struct radio *radio);
+bool rig_antenna_supported(const struct radio *radio);
+void set_rig_antenna(struct radio *radio, int ant, bool remember);
+void restore_rig_antenna_for_band(struct radio *radio);
 void set_scope_mode(struct radio *radio,int mode);
 void set_scope() ;
+void recenter_scope();
+bool yaesu_scope_supported(const struct radio *radio);
+void service_yaesu_scope();
+void send_yaesu_scope_level_query(struct radio *radio);
+void set_yaesu_scope_level_x2(struct radio *radio, int level_x2, bool remember);
+void set_yaesu_preamp(struct radio *radio, int preamp, bool remember);
+void restore_yaesu_band_settings(struct radio *radio);
 void send_rit_setting(struct radio *radio, int rit, int xit) ;
 void send_rit_freq_civ(struct radio *radio, int freq) ;
+bool rit_control_supported(struct radio *radio);
+void set_rit_control(struct radio *radio, bool on);
+void select_rit_adjust_target(struct radio *radio);
+void select_xit_adjust_target(struct radio *radio);
+void adjust_rit_xit_offset(struct radio *radio, int delta_hz);
 bool xit_control_supported(struct radio *radio);
+bool yaesu_rx_control_supported(struct radio *radio);
+int cycle_rx_filter(struct radio *radio);
+int cycle_rx_agc(struct radio *radio);
+int cycle_yaesu_width(struct radio *radio);
+int cycle_yaesu_agc(struct radio *radio);
 void set_xit_control(struct radio *radio, bool on);
 void set_xit_offset_hz(struct radio *radio, int offset_hz);
 void apply_xit_for_operating_mode(struct radio *radio);
@@ -103,6 +125,7 @@ void request_icom_clock_sync(struct radio *radio);
 int request_icom_clock_sync_all();
 void service_icom_clock_sync();
 void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio);
+void request_mode_change_radio(const char *opmode, int filnr, struct radio *radio);
 void send_mode_set_civ(const char *opmode, int filnr) ;
 void send_gps_query_civ(struct radio *radio) ;
 void send_freq_query_civ(struct radio *radio) ;
@@ -183,6 +206,7 @@ int antenna_alternate_command(char *s);
 
 void save_freq_mode_filt(struct radio *radio) ;
 void recall_freq_mode_filt(struct radio *radio) ;
+void recall_freq_mode_filt_for_band(int target_bandid, struct radio *radio);
 void recall_freq_mode_filt_for_modetype(struct radio *radio, int target_modetype) ;
 int bandid2freq(int bandid, struct radio *radio) ;
 char *default_opmode(int bandid, int modetype) ;

@@ -29,5 +29,7 @@ void start_memstat_watch(Stream *output = nullptr);
 void stop_memstat_watch(Stream *output = nullptr);
 void process_memstat_watch();
 void rebind_memstat_output(Stream *old_output, Stream *new_output);
+void set_subkbd_diag(bool enabled, Stream *output = nullptr);
+void query_subkbd_diag(Stream *output = nullptr);
 //extern xTaskHandle gxHandle_USBloop;
 #endif

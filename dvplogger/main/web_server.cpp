@@ -240,7 +240,7 @@ void process_web_ui_queue() {
       } else if (!strcmp(cmd.name,"Band")) {
         radio=so2r.radio_selected();
         if (cmd.value>=1 && cmd.value<N_BAND && (((1<<(cmd.value-1)) & radio->band_mask)==0))
-          band_change(cmd.value,radio);
+          band_change_from(cmd.value, radio, "WEB");
       }
     } else if (cmd.type == WEB_UI_ENTER) {
       // Keep the radio selected on /op when Enter was pressed.  The queue is

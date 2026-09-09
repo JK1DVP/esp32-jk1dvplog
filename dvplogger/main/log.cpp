@@ -216,10 +216,16 @@ void enable_radios(int idx_radio, int radio_cmd) {
 
 
 void switch_bands(struct radio *radio) {
+  switch_bands_from(radio, "UNKNOWN");
+}
+
+void switch_bands_from(struct radio *radio, const char *source) {
 
   int tmp, count;
   count = 0;
-  tmp = radio->bandid;
+  tmp = (radio->f_freqchange_pending && radio->bandid_target > 0)
+            ? radio->bandid_target
+            : radio->bandid;
   while (count < N_BAND) {
     tmp++;
     if (tmp >= N_BAND) tmp = 1;
@@ -231,7 +237,7 @@ void switch_bands(struct radio *radio) {
     }
     if (((1 << (tmp - 1)) & radio->band_mask) == 0) {
       // ok to change
-      band_change(tmp, radio);
+      band_change_from(tmp, radio, source);
       break;
     }
     count++;
@@ -239,20 +245,51 @@ void switch_bands(struct radio *radio) {
 }
 
 void band_change(int bandid, struct radio *radio) {
+  band_change_from(bandid, radio, "UNKNOWN");
+}
+
+void band_change_from(int bandid, struct radio *radio, const char *source) {
   // change to bandid
   if (bandid <= 0) bandid = N_BAND - 1; // last bandid = N_BAND -1
   if (bandid >= N_BAND) bandid = 1; // 
-  save_freq_mode_filt(radio);
-  radio->bandid = bandid;
-  radio->cq[radio->modetype] = LOG_SandP;  // force move to S&P
-  recall_freq_mode_filt(radio);
+
+  if (!plogw->f_console_emu) {
+    const int mt = radio->modetype;
+    unsigned int sp = 0, cq = 0;
+    if (mt >= 0 && mt < 4 && bandid > 0 && bandid < N_BAND) {
+      sp = radio->freqbank[bandid][LOG_SandP][mt];
+      cq = radio->freqbank[bandid][LOG_CQ][mt];
+    }
+    console->printf(
+        "BANDREQ t=%lu radio=%d src=%s req=b%d actual=%u/b%d "
+        "pending=%d target=%u/b%d mode=%d sp=%u cq=%u\n",
+        (unsigned long)millis(), radio->rig_idx,
+        source ? source : "?", bandid,
+        radio->freq, radio->bandid, radio->f_freqchange_pending,
+        radio->freq_target, radio->bandid_target, mt, sp, cq);
+  }
+  if (radio->rig_spec && radio->rig_spec->cat_type == CAT_TYPE_NOCAT) {
+    save_freq_mode_filt(radio);
+    radio->bandid = bandid;
+    recall_freq_mode_filt(radio);
+  } else {
+    // Actual freq/bandid remain rig-confirmed.  A second band request while
+    // pending simply replaces target freq/band, using the previous target as
+    // the navigation base in switch_bands().
+    if (!radio->f_freqchange_pending)
+      save_freq_mode_filt(radio);
+    recall_freq_mode_filt_for_band(bandid, radio);
+  }
   //  send_mode_set_civ(mode_str[bandmap_disp.on_cursor_modeid], radio->filtbank[radio->cq[radio->modetype]][radio->modetype]); // cw phone switch filter selection!
   //set_frequency(bandid2freq(radio->bandid));
   //set_frequency_rig(bandid2freq(radio->bandid));
   request_display_update_on_demand();
 
   // notify changed band to zserver
-  sprintf(buf,"#ZLOG# BAND %d",zserver_bandid_freqcodes_map[radio->bandid]);
+  const int notify_bandid =
+      (radio->f_freqchange_pending && radio->bandid_target > 0)
+          ? radio->bandid_target : radio->bandid;
+  sprintf(buf,"#ZLOG# BAND %d",zserver_bandid_freqcodes_map[notify_bandid]);
   zserver_send(buf);
   
 
